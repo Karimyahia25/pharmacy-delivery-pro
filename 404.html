@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1d4ed8">
+<title>متابعة التوصيل Pro</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="stylesheet" href="css/app.css">
+<!-- SheetJS لتنزيل الإكسل (بيتحمّل مرة وبعدين من الكاش) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
+</head>
+<body>
+
+<div id="boot" class="center"><p class="sub">جاري التحميل…</p></div>
+
+<!-- رسالة كاملة الشاشة (لسه مفيش مشروع Firebase / الحساب مش متسجل) -->
+<div id="msg" class="center" hidden>
+  <div class="card">
+    <h1 id="msgT"></h1>
+    <p class="sub" id="msgB"></p>
+    <button class="ghost" id="msgOut" hidden>تسجيل الخروج</button>
+  </div>
+</div>
+
+<form id="login" class="center" hidden autocomplete="on">
+  <div class="card">
+    <div class="logo">🛵</div>
+    <h1 id="loginName">متابعة التوصيل</h1>
+    <p class="sub">سجّل دخولك علشان تبدأ</p>
+    <label for="lu">اسم المستخدم</label>
+    <input id="lu" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" dir="ltr" required>
+    <label for="lp">كلمة السر</label>
+    <input id="lp" name="password" type="password" autocomplete="current-password" dir="ltr" required>
+    <button class="go" id="lgo" type="submit">دخول</button>
+    <div class="err" id="lerr" role="alert"></div>
+  </div>
+</form>
+
+<div id="app" hidden>
+  <header class="top">
+    <div class="brand"><span class="logo sm">🛵</span><b id="appName"></b><span class="badge-pro">PRO</span></div>
+    <div class="who"><span id="net" class="net" role="status"></span><span id="appUser"></span><button class="ghost sm" id="pwBtn" type="button" hidden title="تغيير كلمة السر" aria-label="تغيير كلمة السر">🔑</button><button class="ghost sm" id="cfgBtn" type="button" hidden>⚙ الإعدادات</button><button class="ghost sm" id="install" type="button" hidden>ثبّت التطبيق</button><button class="ghost sm" id="appOut" type="button">خروج</button></div>
+  </header>
+  <div id="offBar" class="offbar" role="alert" hidden>⚠ مفيش اتصال بالإنترنت — بتشوف آخر بيانات اتحمّلت. التسجيل والتسليم والحذف متوقفين لحد ما النت يرجع.</div>
+  <div id="cfgHint" class="banner" hidden>لسه ماظبطتش إعدادات الصيدلية (الاسم والمناطق والموظفين). <button type="button" class="ghost sm" id="cfgHintGo">افتح الإعدادات</button></div>
+  <main id="delRoot"></main>
+  <section id="settings" hidden></section>
+</div>
+
+<div id="pwDlg" class="dlgback" hidden>
+  <div class="card" role="dialog" aria-labelledby="pwT">
+    <h1 id="pwT">🔑 تغيير كلمة السر</h1>
+    <label for="pwCur">كلمة السر الحالية</label><input id="pwCur" type="password" dir="ltr" autocomplete="current-password">
+    <label for="pwNew">كلمة السر الجديدة (8 حروف على الأقل)</label><input id="pwNew" type="password" dir="ltr" autocomplete="new-password">
+    <label for="pwNew2">تأكيد كلمة السر الجديدة</label><input id="pwNew2" type="password" dir="ltr" autocomplete="new-password">
+    <div class="err" id="pwErr" role="alert"></div>
+    <div class="cfgbtns"><button type="button" class="go" id="pwSave">حفظ</button><button type="button" class="ghost" id="pwCancel">إلغاء</button></div>
+  </div>
+</div>
+
+<script type="module" src="src/app.js"></script>
+</body>
+</html>

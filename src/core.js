@@ -1,0 +1,904 @@
+// برنامج متابعة التوصيل للصيدليات (منتج مستقل) — core.js
+// الإعدادات (المناطق، العمولة، وعد الدقايق، اليوم التشغيلي، الاسم…) في config.js · الدخول وقاعدة البيانات في firebase.js.
+// الأوردرات في deliv_orders والطيارين في deliv_drivers وسجل التغييرات في deliv_log (بيتكتب بس). الوقت بالـ ms.
+// الأوقات التلاتة: startTime = وقت التسجيل · assignedAt = خروج المندوب · endTime = التسليم. endSource: app = ضغطة «تسليم» (موثوق).
+// القراية: الشاشة الحية بتسمع على الأوردرات المفتوحة + اللي اتسلّم من بداية اليوم التشغيلي بس. الإحصائيات بتسحب الفترة عند الطلب (علشان حصة Firebase المجانية).
+// العمولة: بتتخزن على الأوردر وقت التسليم (comm) فتغيير السعر بعدين مبيغيّرش القديم.
+import { CFG } from "./config.js";
+import { getDb, getUid } from "./firebase.js";
+import { doc, setDoc, updateDoc, deleteDoc, addDoc, collection, onSnapshot, query, orderBy, limit, where, getDocs, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const $ = (s, r = document) => r.querySelector(s);
+const esc = t => String(t == null ? '' : t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const N = n => (n == null || isNaN(n)) ? '—' : Math.round(n).toLocaleString('en-US');
+const M = n => N(n) + ' ' + CFG.currency;
+const MIN = 60000, BATCH_GAP = 5 * MIN, LATE_SINGLE = 20 * MIN, PROMISE = CFG.promiseMin * MIN;
+const EMPLOYEES = CFG.employees;
+const ZONES = [CFG.zones.in, CFG.zones.out];
+// لو الأدمن غيّر اسم منطقة، الاسم القديم بيفضل في zoneAliases علشان الأوردرات القديمة تتحسب صح (داخل/خارج + العمولة)
+const IN_SET = new Set([ZONES[0], ...(CFG.zoneAliases.in || [])]), OUT_SET = new Set([ZONES[1], ...(CFG.zoneAliases.out || [])]);
+const zoneName = z => OUT_SET.has(z) ? ZONES[1] : ZONES[0];
+const COMM_OUT = CFG.commissionOut;   // عمولة الدليفري على كل أوردر اتسلّم خارج النطاق
+const isOut = o => OUT_SET.has(o.zone);
+const commFor = zone => OUT_SET.has(zone) ? COMM_OUT : 0;
+const commOf = o => o.comm != null ? o.comm : commFor(o.zone);   // المتخزنة وقت التسليم، وللقديم بالسعر الحالي
+
+const TZ = CFG.timezone, DAY_START = CFG.dayStartHour;
+const _h12 = DAY_START % 12 || 12, DSP = `${_h12} ${DAY_START < 12 ? 'ص' : 'م'}`, DSN = DSP.replace(' ', ''), DSL = DAY_START < 12 ? `${_h12} الصبح` : `${_h12} ${DAY_START < 17 ? 'الضهر' : 'المغرب'}`;   // نص بداية اليوم التشغيلي: «9 ص» / «9ص» / «9 الصبح»
+const dayKey = ts => new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date(ts));
+const timeStr = ts => ts ? new Intl.DateTimeFormat(CFG.locale, { timeZone: TZ, hour: 'numeric', minute: '2-digit' }).format(new Date(ts)) : '—';
+const opDay = ts => dayKey(ts - DAY_START * 3600e3);   // اليوم التشغيلي بيبدأ من DAY_START: الشيفت اللي بيعدّي نص الليل يفضل في يوم واحد
+const addDay = (k, n) => { const [y, m, d] = k.split('-').map(Number); return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10); };
+const cairoHour = ts => +new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', hour12: false }).format(new Date(ts));
+function cairoStart(k) {   // بداية اليوم التشغيلي k (الساعة DAY_START بتوقيت الصيدلية) بالـ ms
+  const [y, m, d] = k.split('-').map(Number);
+  for (let h = -14; h <= 36; h++) { const t = Date.UTC(y, m - 1, d, h); if (dayKey(t) === k && cairoHour(t) === DAY_START) return t; }
+  return Date.UTC(y, m - 1, d, DAY_START - 2);
+}
+const dayLbl = ts => { const k = opDay(ts); return `${+k.slice(8)}/${+k.slice(5, 7)}`; };
+const dateStr = ts => { const [y, m, d] = dayKey(ts).split('-'); return `${+d}/${+m}`; };
+const dur = ms => { if (ms == null || isNaN(ms)) return '—'; const s = Math.max(0, Math.round(ms / 1000)); const m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)}س ${m % 60}د` : `${m}:${String(s % 60).padStart(2, '0')}`; };
+const durMin = ms => (ms == null || isNaN(ms)) ? '—' : Math.round(ms / MIN) + ' د';
+const nm = n => String(n || '').replace(/\*/g, '').trim();
+
+let ROOT, ROLE, DB, UID, ORDERS = [], DRIVERS = [], READY = 0, EDIT = null, UNSUB = [], UDONE = null, TICK = null, REFRESH = null;
+let OPEN = new Map(), DONE = new Map(), HIST = [];   // OPEN = المفتوح · DONE = اللي اتسلّم من 9 الصبح · HIST = فترة الإحصائيات (عند الطلب)
+const HC = new Map();                                   // كاش الفترات: 'من|إلى' ← {at, rows}
+let ASG = {};   // اختيار المندوب والمنطقة لأوردرات السيستم اللي لسه متوزعتش
+let DR = {};   // مسودة الفورم (علشان التحديث التلقائي ميمسحش اللي اتكتب)
+let ST = { cday: '', view: 'live', period: 'today', from: '', to: '', driver: '', zone: '', mute: false, shown: 60 };
+const ALARMED = new Set();
+
+const canWrite = () => ROLE === 'admin' || ROLE === 'cashier';
+const isAdm = () => ROLE === 'admin';
+const canDrv = () => ROLE === 'admin' || ROLE === 'cashier';   // (2/11، طلبه) إضافة/شيل مندوب: الأدمن وجهاز الدليفري
+const seeStats = () => ROLE === 'admin' || ROLE === 'viewer';
+
+/* ---------- الطلعات المجمعة (بوقت خروج المندوب) ---------- */
+const t0 = o => o.assignedAt || o.startTime;
+function batchMap(list, now) {
+  const map = new Map(), byDrv = new Map();
+  list.forEach(o => { const k = (o.driverName || '').trim().toLowerCase(); if (!k) return; if (!byDrv.has(k)) byDrv.set(k, []); byDrv.get(k).push(o); });
+  byDrv.forEach(arr => {
+    arr.sort((a, b) => t0(a) - t0(b));
+    const clusters = []; let cur = [];
+    arr.forEach(o => { if (cur.length && Math.abs(t0(o) - t0(cur[cur.length - 1])) > BATCH_GAP) { clusters.push(cur); cur = []; } cur.push(o); });
+    if (cur.length) clusters.push(cur);
+    clusters.forEach(c => {
+      const size = c.length, start = Math.min(...c.map(t0));
+      const done = c.filter(o => o.status === 'COMPLETED' && o.endTime);
+      const end = done.length ? Math.max(...done.map(o => o.endTime)) : null;
+      const total = done.length ? Math.max(0, end - start) : Math.max(0, now - start);
+      c.forEach((o, i) => map.set(o.id, { batch: size > 1, size, idx: i + 1, start, eff: Math.round(total / size) }));
+    });
+  });
+  return map;
+}
+const rideMs = (o, b) => o.endTime ? (b ? b.eff : o.endTime - t0(o)) : null;   // من خروج المندوب (نصيب الأوردر من الطلعة)
+const totMs = o => o.endTime ? o.endTime - o.startTime : null;                   // من الفاتورة/التسجيل لحد التسليم = اللي العميل شافه
+const endSrc = o => o.endSource || (o.source === 'pos' ? 'pos' : 'app');
+
+/* ---------- ستايل ---------- */
+function css() {
+  if ($('#delCss')) return;
+  const s = document.createElement('style'); s.id = 'delCss';
+  // نفس ألوان وترتيب برنامج جيميناي الأصلي (slate + emerald للداخل، indigo للخارج، أحمر للمتأخر)
+  s.textContent = `
+.delwrap{color:#1e293b;text-align:right}
+.delwrap .dbar{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;margin:4px 0 14px;padding:4px;border-radius:16px;background:#f1f5f9;border:1px solid #e2e8f0}
+.delwrap .dbar::-webkit-scrollbar{display:none}
+.delwrap .dbar button{flex:1 0 auto;background:transparent;color:#475569;border:0;border-radius:12px;padding:9px 16px;font-size:14px;font-weight:700;min-height:44px;box-shadow:none}
+.delwrap .dbar button.on{background:#fff;color:#047857;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.delwrap .dbar .n{display:inline-block;margin-inline-start:6px;background:#d1fae5;color:#065f46;border-radius:99px;padding:1px 8px;font-size:12px}
+.delwrap .topbar{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0 0 14px}
+.delwrap .topbar .newbar:only-child{grid-column:1/-1}
+.delwrap .newbar.comm{background:linear-gradient(135deg,#b45309,#f59e0b);box-shadow:0 10px 18px -8px rgba(217,119,6,.7)}
+.delwrap .newbar.comm small{color:#fef3c7}
+@media(max-width:560px){.delwrap .newbar{font-size:15px;min-height:58px}.delwrap .newbar small{font-size:10.5px}}
+.delwrap .mdl .cmm{margin-top:0}
+.delwrap .newbar{width:100%;min-height:66px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;margin:0;border-radius:18px;border:0;background:linear-gradient(135deg,#047857,#10b981);color:#fff;font-size:20px;font-weight:900;box-shadow:0 10px 18px -8px rgba(5,150,105,.7);cursor:pointer}
+.delwrap .newbar small{font-size:12px;font-weight:600;color:#d1fae5}
+.delwrap .ocgrid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));align-items:start}
+.delwrap .ocgrid .oc{margin-bottom:0}
+@media(max-width:480px){.delwrap .ocgrid{grid-template-columns:1fr}}
+.delwrap h3.sec.need{color:#b45309;background:#fffbeb;border:1px solid #fcd34d;border-radius:12px;padding:8px 12px}
+.dgrp{margin-bottom:14px}.dgh{display:flex;align-items:center;gap:8px;width:100%;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:12px;padding:8px 12px;min-height:44px;margin-bottom:8px;box-shadow:none;color:#1e293b;font-size:15px}.dgh .dgt{margin-inline-start:auto;font-size:12px;color:#475569}
+.mback{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:70;display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:18px 12px}
+.mdl{position:relative;width:min(560px,100%);margin:auto}
+.mdl .mclose{position:absolute;top:10px;left:10px;z-index:2;width:40px;height:40px;padding:0;border-radius:50%;background:#f1f5f9;color:#334155;border:1px solid #e2e8f0;font-size:18px;box-shadow:none}
+.delwrap .split{display:grid;grid-template-columns:340px minmax(0,1fr);gap:16px;align-items:start}
+@media(max-width:1000px){.delwrap .split{grid-template-columns:1fr}.delwrap .pane.need{order:2}}
+.delwrap .pane{background:#fff;border:1px solid #e2e8f0;border-radius:18px;padding:12px}
+.delwrap .pane.need{background:#fffbeb;border-color:#fcd34d}
+.delwrap .pane h3{margin:0 0 10px;font-size:15px;font-weight:900;color:#1e293b}
+.delwrap .pane.need h3{color:#b45309}
+.delwrap .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+@media(max-width:600px){.delwrap .tiles{grid-template-columns:1fr 1fr;gap:8px}.delwrap .tile .tbtn .fin{font-size:13px}}
+.delwrap .stack{display:flex;flex-direction:column;gap:10px}
+.delwrap .stack .oc{margin:0}
+.delwrap .tile{padding:10px;gap:6px;border-radius:14px;margin:0;min-width:0}
+.delwrap .tile .th{display:flex;justify-content:space-between;align-items:center;gap:4px}
+.delwrap .tile .dn{font-size:15px;font-weight:900;color:#1e293b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.delwrap .tile .tt{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.delwrap .tile .bd{font-size:13px;padding:3px 10px}
+.delwrap .tile .tc{font-size:12px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.delwrap .sugh{font-size:12px;color:#92400e;background:#fffbeb;border:1px dashed #fcd34d;border-radius:10px;padding:6px 10px}
+.delwrap .pill.sys{background:#f1f5f9;color:#475569;border:1px solid #e2e8f0}
+.delwrap .pill.sys.ok{background:#dcfce7;color:#166534;border-color:#bbf7d0}
+.delwrap .pill.sys.bad{background:#fee2e2;color:#991b1b;border-color:#fecaca;font-weight:800}
+.delwrap .tile .rd{font-size:10.5px;color:#64748b;margin-top:-3px}
+.delwrap .tile .tm2 b{font-size:18px;font-weight:900;color:#047857}
+.delwrap .tile.late .tm2 b{color:#b91c1c}
+.delwrap .tile .tm2 small{display:block;font-size:10.5px;color:#64748b}
+.delwrap .tile .tb{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.delwrap .tile .tb .bg{font-size:11px;padding:2px 7px}
+.delwrap .tile .tb .pb{padding:1px 6px;font-size:12px;margin:0}
+.delwrap .tile .nt{font-size:14px}
+.delwrap .tile .tbtn{display:flex;flex-direction:column;gap:6px;margin-top:auto}
+.delwrap .tile .tbtn .fin{width:100%;min-height:38px;background:#059669;color:#fff;border:0;border-radius:10px;font-size:14px;font-weight:800;padding:6px;box-shadow:none}
+.delwrap .tile .ib{display:flex;gap:6px}
+.delwrap .tile .ib button{flex:1;min-height:34px;padding:4px;border-radius:9px;font-size:15px;box-shadow:none;border:1px solid #e2e8f0;background:#f8fafc;color:#334155}
+.delwrap .dlay{display:grid;gap:20px;grid-template-columns:1fr;align-items:start}
+@media(min-width:1024px){.delwrap .dlay{grid-template-columns:5fr 6fr}}
+.delwrap .dform{background:#fff;border-radius:24px;border:1px solid #e2e8f0;padding:24px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+.delwrap .dform.edit{outline:3px solid #fbbf24}
+.delwrap .dform h3{margin:0 0 16px;padding-bottom:12px;border-bottom:1px solid #e2e8f0;font-size:18px;font-weight:800;color:#1e293b}
+.delwrap .fld{margin-bottom:16px}
+.delwrap .fld>label,.delwrap .lbl{display:block;font-size:14px;font-weight:500;color:#475569;margin:0 0 4px}
+.delwrap .lbl.b{font-weight:700;color:#334155}
+.delwrap .req{color:#ef4444;font-weight:800}
+.delwrap .dform input[type=text],.delwrap .dform input[type=number],.delwrap .dform input:not([type]),.delwrap .dform select{width:100%;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:10px 12px;font-size:15px;color:#1e293b;margin:0;min-height:44px}
+.delwrap .dform input:focus,.delwrap .dform select:focus{outline:2px solid #10b981;border-color:#10b981}
+.delwrap .emp select{font-weight:700}
+.delwrap .row2{display:flex;gap:8px}
+.delwrap .row2 select{flex:1}
+.delwrap .trash{background:#fef2f2;color:#ef4444;border:0;border-radius:12px;padding:0 14px;min-height:44px;font-size:17px;box-shadow:none}
+.delwrap .lnk{background:none;border:0;color:#059669;font-size:12px;font-weight:600;padding:0;min-height:0;box-shadow:none;cursor:pointer}
+.delwrap .zones{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.delwrap .zones.miss button{box-shadow:0 0 0 3px #fca5a5}
+.delwrap .zones button{border-radius:16px;padding:14px 12px;text-align:right;display:flex;flex-direction:column;gap:8px;min-height:104px;font-weight:400;align-items:stretch;border-width:2px;border-style:solid;box-shadow:none}
+.delwrap .zones button b{display:block;font-size:17px;font-weight:900;line-height:1.3}
+.delwrap .zones button small{font-size:13px;font-weight:700}
+.delwrap .zones button .ic{width:34px;height:34px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:17px}
+.delwrap .zones button.in{background:#ecfdf5;border-color:#34d399;color:#064e3b}
+.delwrap .zones button.in small{color:#047857}.delwrap .zones button.in .ic{background:#a7f3d0}
+.delwrap .zones button.out{background:#eef2ff;border-color:#818cf8;color:#312e81}
+.delwrap .zones button.out small{color:#4338ca}.delwrap .zones button.out .ic{background:#c7d2fe}
+.delwrap .zones button.on.in{background:#059669;border-color:#047857;color:#fff;box-shadow:0 4px 10px rgba(5,150,105,.35)}
+.delwrap .zones button.on.in small{color:#d1fae5}.delwrap .zones button.on.in .ic{background:#fff}
+.delwrap .zones button.on.out{background:#4f46e5;border-color:#3730a3;color:#fff;box-shadow:0 4px 10px rgba(79,70,229,.35)}
+.delwrap .zones button.on.out small{color:#e0e7ff}.delwrap .zones button.on.out .ic{background:#fff}
+.delwrap .g2{display:grid;gap:12px;grid-template-columns:1fr}
+@media(min-width:640px){.delwrap .g2{grid-template-columns:1fr 1fr}}
+.delwrap .pays{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.delwrap .pay{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px;border-radius:16px;border:1px solid #e2e8f0;background:#f8fafc;color:#334155;cursor:pointer;user-select:none;margin:0}
+.delwrap .pay>span{display:flex;align-items:center;gap:8px}
+.delwrap .pay .ic{width:32px;height:32px;border-radius:12px;background:#e2e8f0;color:#64748b;display:flex;align-items:center;justify-content:center;font-size:15px;flex:none;font-style:normal}
+.delwrap .pay b{display:block;font-size:14px;line-height:1.2}
+.delwrap .pay small{font-size:10px;color:#64748b;font-weight:500}
+.delwrap .pay input{width:20px!important;height:20px;min-height:0!important;margin:0;padding:0}
+.delwrap .pay.visa.on{background:#eff6ff;border-color:#3b82f6;box-shadow:0 0 0 1px #60a5fa;color:#172554}
+.delwrap .pay.visa.on .ic{background:#2563eb;color:#fff}
+.delwrap .pay.voda.on{background:#fff1f2;border-color:#f43f5e;box-shadow:0 0 0 1px #fb7185;color:#4c0519}
+.delwrap .pay.voda.on .ic{background:#e11d48;color:#fff}
+.delwrap .go{width:100%;min-height:48px;margin-top:8px;background:#059669;color:#fff;border:0;border-radius:12px;font-size:16px;font-weight:700;box-shadow:0 10px 15px -3px rgba(167,243,208,.9)}
+.delwrap .go.ghost{background:#f1f5f9;color:#475569;box-shadow:none}
+.delwrap .lhead{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding-bottom:8px;border-bottom:1px solid #f1f5f9;margin-bottom:16px}
+.delwrap .lhead h2{margin:0;font-size:18px;font-weight:900;color:#1e293b}
+.delwrap .pill{display:inline-block;border-radius:99px;padding:2px 10px;font-size:12px;font-weight:700;background:#d1fae5;color:#065f46;margin-inline-start:8px}
+.delwrap .pill.red{background:#fee2e2;color:#b91c1c;border:1px solid #fecaca}
+.delwrap .sndb{font-size:12px;font-weight:600;border-radius:12px;padding:6px 10px;min-height:0;border:1px solid #a7f3d0;background:#ecfdf5;color:#047857;box-shadow:none}
+.delwrap .sndb.off{background:#f1f5f9;color:#94a3b8;border-color:transparent}
+.delwrap .oc{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:14px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.05);display:flex;flex-direction:column;gap:9px}
+.delwrap .oc.batch{border:2px solid #c7d2fe}
+.delwrap .oc.outz{border:2px solid #818cf8}
+.delwrap .oc.late{background:rgba(254,242,242,.85);border:2px solid #f87171;box-shadow:0 0 0 1px #f87171,0 4px 6px rgba(254,202,202,.6)}
+.delwrap .oc .top{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px}
+.delwrap .who{display:flex;gap:12px;align-items:center}
+.delwrap .av{width:44px;height:44px;border-radius:50%;background:#d1fae5;border:2px solid #a7f3d0;display:flex;align-items:center;justify-content:center;font-size:21px;flex:none}
+.delwrap .oc.batch .av,.delwrap .oc.outz .av{background:#eef2ff;border-color:#a5b4fc}
+.delwrap .oc.late .av{background:#fee2e2;border-color:#f87171}
+.delwrap .who h4{margin:0;font-size:16px;font-weight:900;color:#1e293b;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.delwrap .oc.late .who h4{color:#450a0a}
+.delwrap .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;align-items:center}
+.delwrap .cu{font-size:12px;color:#64748b;font-weight:500}
+.delwrap .bg{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;border:1px solid}
+.delwrap .bg.emp{color:#065f46;background:#ecfdf5;border-color:#a7f3d0}
+.delwrap .bg.zin{color:#fff;background:#059669;border-color:#047857;font-size:12.5px;padding:3px 10px;font-weight:800}
+.delwrap .bg.zout{color:#fff;background:#4f46e5;border-color:#3730a3;font-size:12.5px;padding:3px 10px;font-weight:800}
+.delwrap .bg.cm{color:#78350f;background:#fef3c7;border-color:#fcd34d;font-size:12.5px;padding:3px 10px;font-weight:800}
+.delwrap .bg.bat{color:#3730a3;background:#eef2ff;border-color:#c7d2fe;font-size:12px;padding:4px 10px;border-radius:12px}
+.delwrap .bg.red{background:#dc2626;color:#fff;border-color:#dc2626;font-weight:800}
+.delwrap .tms{display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+.delwrap .bd{display:inline-block;padding:4px 12px;border-radius:99px;font-size:12px;font-weight:700;background:#f1f5f9;color:#334155}
+.delwrap .bd.warn{background:#fef3c7;color:#92400e;border:1px solid #fde68a}
+.delwrap .bd.out{background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe}
+.delwrap .bd.late{background:#dc2626;color:#fff}
+.delwrap .dt{display:flex;gap:8px;font-size:11px;color:#64748b;font-weight:600}
+.delwrap .dt span{background:#f1f5f9;border-radius:6px;padding:2px 8px}
+.delwrap .dgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.delwrap .dgrid>div{background:#f8fafc;border-radius:12px;padding:8px}
+.delwrap .oc.late .dgrid>div{background:rgba(254,226,226,.7);border:1px solid #fecaca}
+.delwrap .dgrid small{display:block;font-size:10px;color:#64748b;font-weight:600;margin-bottom:2px}
+.delwrap .dgrid b{font-size:14px;color:#1e293b}
+.delwrap .oc.late .dgrid b{color:#7f1d1d}
+.delwrap .pb{display:inline-flex;gap:4px;align-items:center;padding:4px 10px;border-radius:8px;font-size:12px;font-weight:900;border:1px solid;margin-inline-end:8px}
+.delwrap .pb.v{background:#dbeafe;color:#1e3a8a;border-color:#bfdbfe}
+.delwrap .pb.f{background:#ffe4e6;color:#881337;border-color:#fecdd3}
+.delwrap .note{background:#fffbeb;border:1px solid #fde68a;border-radius:12px;padding:10px;font-size:12px;font-weight:600;color:#78350f}
+.delwrap .ftr{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;border-top:1px solid #f1f5f9;padding-top:12px}
+.delwrap .tot{background:#f8fafc;border-radius:12px;padding:8px 14px;text-align:center}
+.delwrap .tot small{display:block;font-size:10px;color:#64748b;font-weight:700}
+.delwrap .tot b{font-size:16px;font-weight:900;color:#047857}
+.delwrap .oc.late .tot b{color:#b91c1c}
+.delwrap .btns{display:flex;flex-wrap:wrap;gap:8px}
+.delwrap .btns button{min-height:42px;border-radius:12px;padding:8px 14px;font-size:13px;font-weight:700;box-shadow:none}
+.delwrap .btns .fin{background:#059669;color:#fff;border:0;box-shadow:0 4px 6px rgba(167,243,208,.9);flex:1 1 90px}
+.delwrap .btns .prn{background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe}
+.delwrap .btns .edt{background:#f1f5f9;color:#334155;border:1px solid #e2e8f0}
+.delwrap .btns .del{background:#f8fafc;color:#64748b;border:1px solid #e2e8f0}
+.delwrap .oc.asg{background:#fffbeb;border:2px dashed #f59e0b}
+.delwrap .oc.asg{gap:8px;padding:12px}
+.delwrap .asgh{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.delwrap .asgh h4{margin:0;font-size:17px;font-weight:900;color:#1e293b}
+.delwrap .asgm{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12.5px;font-weight:600;color:#475569}
+.delwrap .asgm .okc{color:#047857}
+.delwrap .asgt2{font-size:11.5px;color:#94a3b8;padding-top:6px;border-top:1px solid #fde68a}
+.delwrap .asgval{display:flex;align-items:center;justify-content:space-between;border:2px dashed #92400e;border-radius:12px;padding:8px 14px;background:#fff7ed}
+.delwrap .asgval small{font-size:13px;color:#78350f;font-weight:700}
+.delwrap .asgval b{font-size:26px;color:#5b3a1e;font-weight:900;line-height:1.1}
+.delwrap .asgbox .zones button.in{background:#f0fdf4;border-color:#86efac;color:#166534}
+.delwrap .asgbox .zones button.in small{color:#15803d}
+.delwrap .asgbox .zones button.on.in{background:#bbf7d0;border-color:#4ade80;color:#14532d;box-shadow:0 3px 8px rgba(74,222,128,.4)}
+.delwrap .asgbox .zones button.on.in small{color:#166534}.delwrap .asgbox .zones button.on.in .ic{background:#fff}
+.delwrap .asgbox .btns{flex-direction:column}
+.delwrap .asgbox .btns button{flex:0 0 auto;width:100%}
+.delwrap .asgbox .btns .fin.tq{background:#5eead4;color:#134e4a;border:1px solid #2dd4bf;box-shadow:0 3px 8px rgba(94,234,212,.5)}
+.delwrap .asgbox .btns .rd{background:#fff;color:#dc2626;border:2px solid #fca5a5}
+.delwrap .asgbox .brnbtn{width:100%;min-height:42px;border-radius:12px;padding:8px 14px;font-size:14px;font-weight:800;background:#ec4899;color:#fff;border:0;box-shadow:0 4px 8px rgba(236,72,153,.35);cursor:pointer}
+.delwrap .asgbox{display:flex;flex-direction:column;gap:8px;border-top:1px solid #fde68a;padding-top:9px}
+.delwrap .asgbox select{width:100%;background:#fff;border:1px solid #fcd34d;border-radius:12px;padding:10px 12px;font-size:15px;font-weight:700;min-height:44px}
+.delwrap .asgbox .zones button{min-height:56px;padding:6px 10px;gap:3px}
+.delwrap .asgbox .zones button b{font-size:15px}
+.delwrap .asgbox .zones.miss button{box-shadow:0 0 0 3px #fca5a5}
+.delwrap .pill.am{background:#fef3c7;color:#92400e;border:1px solid #fcd34d}
+.delwrap .hint2{font-size:12px;color:#64748b;margin:-8px 0 14px;background:#f8fafc;border-radius:10px;padding:8px 10px}
+.delwrap .dk{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:12px}
+.delwrap .dk>div{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:12px 14px;border-inline-start:4px solid #10b981}
+.delwrap .dk .l{font-size:12px;color:#64748b}.delwrap .dk .v{font-size:21px;font-weight:800}
+.delwrap .dk .bad{border-inline-start-color:#dc2626}
+.delwrap .chip,.delwrap .seg button{min-height:40px;border-radius:99px;padding:6px 14px;background:#fff;color:#334155;border:1px solid #e2e8f0;font-weight:700;font-size:13px;box-shadow:none}
+.delwrap .chip.on{background:#059669;color:#fff;border-color:#059669}
+.delwrap .tag{display:inline-block;border-radius:8px;padding:1px 8px;font-size:12px;font-weight:700;background:#f1f5f9;color:#475569;margin-inline-end:4px}
+.delwrap .tag.b{background:#eef2ff;color:#3730a3}.delwrap .tag.o{background:#4f46e5;color:#fff}.delwrap .tag.i{background:#059669;color:#fff}
+.delwrap .cmm{background:#fff;border:1px solid #fcd34d;border-radius:20px;padding:18px;margin-top:20px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+.delwrap .cmm h2{margin:0;font-size:18px;font-weight:900}
+.delwrap .cmm .cd{display:flex;gap:8px;align-items:center;font-size:13px;font-weight:700;color:#475569}
+.delwrap .cmm .cd input{width:auto;min-height:40px}
+.delwrap .cmm td b{color:#b45309;font-size:16px}
+.delwrap .cmm .hint{font-size:12px;color:#64748b;margin:8px 0 0}
+.delwrap .tw{overflow-x:auto;background:#fff;border:1px solid #e2e8f0;border-radius:16px;margin-bottom:12px}
+.delwrap table{width:100%;border-collapse:collapse;font-size:13.5px}
+.delwrap th,.delwrap td{padding:9px 10px;border-bottom:1px solid #f1f5f9;text-align:center;white-space:nowrap}
+.delwrap th{background:#f8fafc;font-size:12.5px;color:#475569}
+.delwrap td.l,.delwrap th.l{text-align:start}
+.delwrap tr.late td{background:#fef2f2}
+.delwrap .ctl{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.delwrap .ctl input,.delwrap .ctl select{width:auto;min-width:130px}
+.delwrap .ctl.chips{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}.delwrap .ctl.chips>*{flex:0 0 auto}
+.delwrap .empty{text-align:center;color:#64748b;padding:26px 10px;background:#fff;border:1px dashed #cbd5e1;border-radius:16px}
+.delwrap h3.sec{margin:16px 0 8px;font-size:16px;font-weight:800}
+.deltoast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;padding:10px 18px;border-radius:12px;z-index:80;font-size:14px}
+`;
+  document.head.appendChild(s);
+}
+// بيرسم الشاشة من جديد. بيستنى بس لو الموظف بيكتب في خانة نص دلوقتي (أقل من 8 ثواني من آخر كتابة)، أو لو نافذة مفتوحة (بنرسم لما تتقفل).
+// (2/11) قبل كده كان بيستنى لو أي select ماسك الفوكس — والموبايل بيسيبه ماسك بعد الاختيار فالأوردر مكانش بيتنقل لـ «جاري توصيلها».
+let LAST_UI = 0;
+function safeRender() {
+  if (!ROOT || !ROOT.isConnected) return;
+  if (ST.formOpen || EDIT || ST.ask) { ST.dirty = true; return; }
+  const a = document.activeElement;
+  if (a && ROOT.contains(a) && /^(INPUT|TEXTAREA)$/.test(a.tagName) && !/^(checkbox|radio|date)$/.test(a.type) && Date.now() - LAST_UI < 8000) { setTimeout(safeRender, 2500); return; }
+  render();
+}
+function toast(t) { const d = document.createElement('div'); d.className = 'deltoast'; d.textContent = t; document.body.appendChild(d); setTimeout(() => d.remove(), 2200); }
+
+/* ---------- صوت ---------- */
+let AC = null;
+function beep(freq = 880, n = 3) {
+  if (ST.mute) return;
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    for (let i = 0; i < n; i++) {
+      const o = AC.createOscillator(), g = AC.createGain(), t = AC.currentTime + i * 0.28;
+      o.frequency.value = freq; o.connect(g); g.connect(AC.destination);
+      g.gain.setValueAtTime(0.25, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.2); o.start(t); o.stop(t + 0.22);
+    }
+  } catch (e) { }
+}
+
+function trashSound() {   // صوت «تفريغ سلة المحذوفات» — بيتولّد بالكود (خشخشة ورق بتتلاشى)، مش ملف ويندوز
+  if (ST.mute) return;
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)(); if (AC.state !== 'running') AC.resume();
+    const T = AC.currentTime, len = Math.floor(AC.sampleRate * 0.9), buf = AC.createBuffer(1, len, AC.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) { const x = i / len, crackle = Math.random() < 0.06 ? 1 : 0.25; d[i] = (Math.random() * 2 - 1) * crackle * Math.pow(1 - x, 1.6); }
+    const src = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+    src.buffer = buf; f.type = 'bandpass'; f.Q.value = 0.8; f.frequency.setValueAtTime(5200, T); f.frequency.exponentialRampToValueAtTime(900, T + 0.85);
+    g.gain.setValueAtTime(0.9, T); g.gain.exponentialRampToValueAtTime(0.01, T + 0.9);
+    src.connect(f); f.connect(g); g.connect(AC.destination); src.start(T);
+  } catch (e) { }
+}
+
+/* ---------- صوت الفاتورة الجديدة ---------- */
+const audioOn = () => !!(AC && AC.state === 'running');
+function armAudio() { try { AC = AC || new (window.AudioContext || window.webkitAudioContext)(); if (AC.state !== 'running') AC.resume(); } catch (e) { } }
+function siren(secs = 3) {   // (7/11) نغمة هادية بس عالية 3 ثواني: 3 نغمات جرس ناعمة (صول ← سي ← ري) بدون حدّة، بجين عالي
+  if (ST.mute) return;
+  try {
+    armAudio();
+    const t0 = AC.currentTime, notes = [784, 988, 1175], step = secs / notes.length;
+    const comp = AC.createDynamicsCompressor(); comp.connect(AC.destination);   // يرفع الإحساس بالعلو من غير تشويه
+    notes.forEach((f, i) => {
+      const t = t0 + i * step;
+      [[f, 1], [f * 2, 0.25]].forEach(([fr, k]) => {                             // نغمة أساسية + هارمونك خفيف = صوت جرس دافي
+        const o = AC.createOscillator(), g = AC.createGain();
+        o.type = 'sine'; o.frequency.value = fr; o.connect(g); g.connect(comp);
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.9 * k, t + 0.12);                  // بداية ناعمة
+        g.gain.exponentialRampToValueAtTime(0.0001, t + step * 0.98);            // وتخفت براحة
+        o.start(t); o.stop(t + step);
+      });
+    });
+  } catch (e) { }
+  try { navigator.vibrate && navigator.vibrate([300, 150, 300]); } catch (e) { }
+}
+let SEEN = null;   // الأوردرات المفتوحة اللي شفناها (أول تحميل مبيرنش)
+function checkNew() {
+  const ids = new Set(OPEN.keys());
+  if (SEEN) { let n = 0; ids.forEach(id => { if (!SEEN.has(id)) { const o = OPEN.get(id); if (o && (CFG.features.posLinked ? (!o.driverName && o.source === 'pos') : o.by !== UID)) n++; } }); if (n) siren(); }
+  SEEN = ids;
+}
+let SYS = null;    // نبضة سيرفر الصيدلية (deliv_sys/sync)
+
+/* ---------- اقتراح المنطقة من عنوان العميل (تجربة 2/11 — الكاشير يغيّره عادي، ودقته بتظهر في الإحصائيات) ---------- */
+const nrm = t => String(t || '').toLowerCase().replace(/[أإآ]/g, 'ا').replace(/ة/g, 'ه').replace(/ى/g, 'ي').replace(/[\u064B-\u0652]/g, '');
+const OUT_KW = (CFG.zoneKeywords.out || []).map(nrm), IN_KW = (CFG.zoneKeywords.in || []).map(nrm);
+function suggestZone(district) {
+  const t = nrm(district); if (!t || t === '0') return '';
+  if (OUT_KW.some(k => t.includes(k))) return ZONES[1];
+  if (IN_KW.some(k => t.includes(k))) return ZONES[0];
+  return '';
+}
+
+/* ---------- البيانات ---------- */
+const rebuild = () => { const m = new Map(OPEN); DONE.forEach((v, k) => m.set(k, v)); ORDERS = [...m.values()]; };
+const findOrder = id => ORDERS.find(o => o.id === id) || HIST.find(o => o.id === id);
+const active = () => ORDERS.filter(o => o.status === 'PENDING').sort((a, b) => b.startTime - a.startTime);   // (5/11، طلبه) الجديد فوق والقديم تحت
+// كل اللي اتسلّم: الفترة المحمّلة + الحي (الحي بيكسب)
+const pool = () => { const m = new Map(); HIST.forEach(o => m.set(o.id, o)); ORDERS.forEach(o => { if (o.status === 'COMPLETED') m.set(o.id, o); }); return [...m.values()].filter(o => o.status === 'COMPLETED' && o.endTime && o.driverName); };
+const drvList = () => { const s = new Set(DRIVERS.map(d => d.name)); ORDERS.forEach(o => o.driverName && s.add(o.driverName)); HIST.forEach(o => o.driverName && s.add(o.driverName)); return [...s]; };
+
+function periodRange() {
+  const now = Date.now(), t = opDay(now), back = n => opDay(now - n * 864e5);
+  switch (ST.period) {
+    case 'today': return [t, t];
+    case 'yest': return [back(1), back(1)];
+    case '7': return [back(6), t];
+    case 'month': return [t.slice(0, 8) + '01', t];
+    case 'custom': { let a = ST.from || t, b = ST.to || t; if (a > b) [a, b] = [b, a]; const lim = addDay(b, -119); if (a < lim) a = lim; return [a, b]; }   // أقصى 120 يوم
+    default: return [back(89), t];                                                                                                              // «آخر 90 يوم»
+  }
+}
+function filtered() {
+  const [a, b] = periodRange();
+  return pool().filter(o => { const k = opDay(o.endTime); return k >= a && k <= b && (!ST.driver || o.driverName === ST.driver) && (!ST.zone || zoneName(o.zone) === ST.zone); });
+}
+async function fetchRange(a, b) {
+  const st = cairoStart(a), en = cairoStart(addDay(b, 1)) - 1;
+  const snap = await getDocs(query(collection(DB, 'deliv_orders'), where('endTime', '>=', st), where('endTime', '<=', en), limit(5000)));
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+async function loadHist(hk) {
+  const c = HC.get(hk);
+  try {
+    if (c && Date.now() - c.at < 600000) HIST = c.rows;
+    else { const [a, b] = hk.split('|'); const rows = await fetchRange(a, b); HC.set(hk, { at: Date.now(), rows }); HIST = rows; }
+  } catch (e) { toast('مقدرتش أحمّل الفترة: ' + (e.code || e.message)); HIST = []; }
+  ST.histKey = hk; ST.loading = false; safeRender();
+}
+function commEnsure() {   // عمولة يوم غير النهارده: بنسحبه عند الطلب
+  const day = ST.cday || opDay(Date.now());
+  if (day === opDay(Date.now())) return;
+  const k = day + '|' + day, c = HC.get(k);
+  if ((c && Date.now() - c.at < 600000) || ST.commLoading === k) return;
+  ST.commLoading = k;
+  fetchRange(day, day).then(rows => HC.set(k, { at: Date.now(), rows })).catch(e => { toast('عمولة اليوم: ' + (e.code || e.message)); HC.set(k, { at: Date.now(), rows: [] }); })
+    .finally(() => { ST.commLoading = ''; safeRender(); });
+}
+
+function driverStats(list, bm) {
+  const mk = n => ({ n, c: 0, tms: 0, rn: 0, rms: 0, val: 0, out: 0, outVal: 0, comm: 0, b: [0, 0, 0, 0, 0] });
+  const m = new Map();
+  drvList().forEach(d => m.set(d, mk(d)));
+  list.forEach(o => {
+    const x = m.get(o.driverName) || (m.set(o.driverName, mk(o.driverName)), m.get(o.driverName));
+    const t = totMs(o) / MIN;
+    x.c++; x.tms += totMs(o); x.val += o.orderValue || 0;
+    if (endSrc(o) === 'app') { x.rn++; x.rms += rideMs(o, bm.get(o.id)); }   // وقت الخروج→التسليم من ضغطة التطبيق بس
+    if (isOut(o)) { x.out++; x.outVal += o.orderValue || 0; x.comm += commOf(o); }
+    x.b[t < 10 ? 0 : t < 15 ? 1 : t < 20 ? 2 : t <= 30 ? 3 : 4]++;
+  });
+  return [...m.values()].sort((a, b) => b.c - a.c);
+}
+
+/* ---------- العرض ---------- */
+function render() {
+  if (!ROOT) return;
+  const act = active(), tabs = [['live', '🛵 شغّال دلوقتي', act.length]];
+  if (seeStats()) tabs.push(['stats', '📊 الطيارين'], ['log', '📋 السجل'], ['audit', '🧾 سجل التغييرات']);
+  if (!tabs.some(t => t[0] === ST.view)) ST.view = 'live';
+  const hk = periodRange().join('|'), hist = seeStats() && (ST.view === 'stats' || ST.view === 'log');
+  if (hist && ST.histKey !== hk && !ST.loading) { ST.loading = true; loadHist(hk); }
+  if (ST.commOpen) commEnsure();
+  if (ST.view === 'audit' && seeStats()) audEnsure();
+  const body = !READY ? '<p class="sub">جاري التحميل…</p>' : ST.view === 'live' ? liveHtml(act) : ST.view === 'audit' ? audHtml()
+    : (ST.loading || ST.histKey !== hk) ? `${filterBar()}<div class="empty">⏳ جاري تحميل أوردرات الفترة…</div>` : ST.view === 'stats' ? statsHtml() : logHtml();
+  ROOT.innerHTML = `<div class="dbar">${tabs.map(t => `<button class="${ST.view === t[0] ? 'on' : ''}" data-v="${t[0]}">${t[1]}${t[2] != null ? `<span class="n">${t[2]}</span>` : ''}</button>`).join('')}
+</div>
+    ${body}${ST.ask ? askHtml() : ''}`;
+  ROOT.querySelectorAll('[data-v]').forEach(b => b.onclick = () => { ST.view = b.dataset.v; EDIT = null; render(); });
+  ROOT.querySelectorAll('[data-hid]').forEach(b => b.onclick = () => { const d = b.dataset.hid; HID.has(d) ? HID.delete(d) : HID.add(d); try { localStorage.setItem('delHid', JSON.stringify([...HID])); } catch (e) { } render(); });
+  ROOT.querySelectorAll('[data-mute]').forEach(b => b.onclick = () => { if (!ST.mute && !audioOn()) { armAudio(); beep(880, 2); setTimeout(render, 300); return; } ST.mute = !ST.mute; render(); });
+  bind();
+}
+
+// «مين بيعمل ده؟» — للحذف والتعديل: الجهاز مشترك فبنسجّل الاسم في deliv_log
+function askWho(text) { return new Promise(res => { ST.ask = { text, res, sel: localStorage.getItem('del_emp') || '' }; render(); }); }
+function askHtml() {
+  return `<div class="mback" data-ask style="z-index:90"><div class="mdl"><div class="dform"><h3>${esc(ST.ask.text)}</h3>
+    <div class="fld"><label>مين اللي بيعمل ده؟ (بيتسجل)</label><select id="whoSel"><option value="">-- اختر اسمك --</option>${EMPLOYEES.map(x => `<option ${x === ST.ask.sel ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></div>
+    <button class="go" data-whook>تأكيد</button><button class="go ghost" data-whono>إلغاء</button></div></div></div>`;
+}
+async function logAct(act, o, extra) {   // سجل بيتكتب بس (deliv_log) — فشله مبيوقفش الشغل
+  try {
+    await addDoc(collection(DB, 'deliv_log'), { at: serverTimestamp(), act, oid: o ? o.id : '', by: UID, who: (extra && extra.who) || '',
+      full: o ? JSON.stringify(o) : '', d: extra && extra.d ? JSON.stringify(extra.d) : '' });
+  } catch (e) { }
+}
+
+function formHtml() {
+  const e = EDIT ? findOrder(EDIT) : null, drs = drvList(), lock = !!(e && e.driverName && !isAdm());
+  const d = e ? { emp: e.employeeName || '', drv: e.driverName, cus: e.customerName || '', zone: e.zone ? zoneName(e.zone) : '', val: e.orderValue, chg: e.changeGiven || '', visa: !!e.isVisa, voda: !!e.isVodafoneCash, note: e.notes || '' }
+    : { emp: DR.emp !== undefined ? DR.emp : (localStorage.getItem('del_emp') || ''), drv: DR.drv || '', cus: DR.cus || '', zone: DR.zone || '', val: DR.val || '', chg: DR.chg || '', visa: !!DR.visa, voda: !!DR.voda, note: DR.note || '' };
+  return `<div class="dform ${e ? 'edit' : ''}" id="dForm"><h3>${e ? '✏️ تعديل الأوردر' : '🚀 تسجيل طلب جديد'}</h3>
+  ${e || !CFG.features.posLinked ? '' : '<p class="hint2">فواتير التوصيل بتنزل هنا لوحدها من ${CFG.posName} — سجّل بإيدك بس الأوردر اللي ملوش فاتورة، علشان ميتكررش.</p>'}
+  <div class="fld emp"><label>الموظف المسئول <span class="req">* (إجباري)</span></label>
+    <select id="dEmp"><option value="">-- اختر الموظف المسئول (إجباري) --</option>${EMPLOYEES.map(x => `<option ${x === d.emp ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></div>
+  <div class="fld"><div style="display:flex;justify-content:space-between;align-items:center"><label style="margin:0">اسم المندوب</label>${canDrv() ? '<button type="button" class="lnk" data-adddrv>+ إضافة مندوب جديد</button>' : ''}</div>
+    <div class="row2"><select id="dDrv">${drs.length ? '' : '<option value="">لا يوجد مناديب مسجلين</option>'}${drs.map(x => `<option ${d.drv === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>
+      ${ROLE === 'admin' ? '<button type="button" class="trash" data-deldrv title="حذف المندوب">🗑</button>' : ''}</div></div>
+  <div class="fld"><label>اسم العميل (اختياري)</label><input id="dCus" placeholder="مثال: محمد أحمد" value="${esc(d.cus)}"></div>
+  <div class="fld"><label class="lbl b">المنطقة والنطاق <span class="req">* (إجباري — لازم تختار واحدة)</span></label>
+    ${lock ? '<p class="hint2">القيمة والمنطقة اتقفلوا بعد تأكيد المندوب — لو غلط اطلب من الأدمن يعدّلهم.</p>' : ''}
+    <div class="zones" id="dZone">
+      <button type="button" ${lock ? 'disabled' : ''} data-z="${ZONES[0]}" class="in ${d.zone === ZONES[0] ? 'on' : ''}"><span class="ic">📍</span><span><b>${ZONES[0]}</b><small>من غير عمولة</small></span></button>
+      <button type="button" ${lock ? 'disabled' : ''} data-z="${ZONES[1]}" class="out ${d.zone === ZONES[1] ? 'on' : ''}"><span class="ic">🧭</span><span><b>${ZONES[1]}</b><small>عمولة الدليفري ${COMM_OUT} ج</small></span></button></div></div>
+  <div class="fld g2"><div><label class="lbl">قيمة الطلب</label><input id="dVal" type="number" inputmode="decimal" min="0" step="0.5" placeholder="0.00" ${lock ? 'disabled' : ''} value="${d.val}"></div>
+    <div><label class="lbl">فكة إضافية للطلب</label><input id="dChg" type="number" inputmode="decimal" min="0" step="0.5" placeholder="0.00" value="${d.chg}"></div></div>
+  <div class="fld"><label class="lbl">طريقة الدفع الخاصة بالطلب</label><div class="pays">
+    <label class="pay visa ${d.visa ? 'on' : ''}"><span><i class="ic">💳</i><span><b>فيزا</b><small>دفع بالفيزا</small></span></span><input type="checkbox" id="dVisa" ${d.visa ? 'checked' : ''}></label>
+    <label class="pay voda ${d.voda ? 'on' : ''}"><span><i class="ic">📱</i><span><b>فودافون كاش</b><small>محفظة إلكترونية</small></span></span><input type="checkbox" id="dVoda" ${d.voda ? 'checked' : ''}></label></div></div>
+  <div class="fld"><label>ملاحظات (للتذكرة)</label><input id="dNote" placeholder="مثال: تسليم عند الباب الخلفي..." value="${esc(d.note)}"></div>
+  <button class="go" id="dGo">${e ? 'حفظ التعديل' : 'بدء التوصيل'}</button>
+  ${e ? '<button class="go ghost" id="dCancel">إلغاء التعديل</button>' : ''}<div class="err" id="dErr"></div></div>`;
+}
+
+const muteLbl = () => ST.mute ? '🔇 الصوت مكتوم' : audioOn() ? '🔊 الصوت مفعل' : '🔈 اضغط هنا لتفعيل الصوت';
+function liveHtml(act) {
+  const now = Date.now(), bm = batchMap(ORDERS.filter(o => o.driverName && now - t0(o) < 36 * 3600e3), now);
+  const needN = act.filter(o => !o.driverName).length;
+  const lateN = act.filter(o => o.driverName && !isOut(o) && now - o.startTime >= PROMISE).length;
+  const cardArr = act.map(o => {
+    if (!o.driverName) return asgCard(o, now);
+    const b = bm.get(o.id) || { batch: false, size: 1, idx: 1 }, out = isOut(o);
+    const late = !out && now - o.startTime >= PROMISE, min = Math.floor((now - o.startTime) / MIN), ride = Math.floor((now - t0(o)) / MIN), warn = min >= 20;
+    const cls = late ? 'late' : out ? 'outz' : b.batch ? 'batch' : '';
+    const tot = (o.orderValue || 0) + (o.changeGiven || 0);
+    return `<div class="oc tile ${cls}" data-id="${o.id}" data-start="${o.startTime}" data-bs="${o.startTime}" data-th="${PROMISE}" data-as="${t0(o)}" data-out="${out ? 1 : 0}" data-batch="${b.batch ? 1 : 0}">
+      <div class="th"><b class="dn">${esc(nm(o.driverName))}</b>${b.batch ? `<span class="bg bat" title="طلعة مجمعة: أوردر ${b.idx} من ${b.size}">🔗 ${b.idx}/${b.size}</span>` : ''}</div>
+      <div class="tt"><span class="bd ${late ? 'late' : out ? 'out' : warn ? 'warn' : ''}" data-bd>🕒 ${min} د</span><span data-lt class="${late ? 'bg red' : ''}">${late ? '⚠ متأخر' : ''}</span></div>
+      <div class="rd" data-rd>خرج من ${ride} د</div>
+      <div class="tc" title="${esc(o.customerName || '')}">${o.customerName ? '👤 ' + esc(o.customerName) : '&nbsp;'}</div>
+      <div class="tm2"><b>${M(tot)}</b>${o.changeGiven ? `<small>قيمة ${N(o.orderValue)} + فكة ${N(o.changeGiven)}</small>` : '<small>&nbsp;</small>'}</div>
+      <div class="tb"><span class="bg ${out ? 'zout' : 'zin'}">${out ? `🧭 خارج · 💰${COMM_OUT}` : '📍 داخل'}</span>${o.isVisa ? '<span class="pb v" title="فيزا">💳</span>' : ''}${o.isVodafoneCash ? '<span class="pb f" title="فودافون كاش">📱</span>' : ''}${o.notes ? `<span class="nt" title="${esc(o.notes)}">📝</span>` : ''}${o.posEndTime ? '<span class="nt" title="اتقفل في السيستم">✅</span>' : ''}</div>
+      ${canWrite() ? `<div class="tbtn"><button class="fin" data-fin="${o.id}">✔ تسليم</button><div class="ib"><button class="prn" data-rc="${o.id}" title="طباعة ريسيت">🖨</button><button class="edt" data-ed="${o.id}" title="تعديل">✏️</button><button class="del" data-rm="${o.id}" title="حذف">🗑</button></div></div>` : ''}</div>`;
+  });
+  const outCards = [], needCards = [];
+  act.forEach((o, n) => (o.driverName ? outCards : needCards).push(cardArr[n]));
+  return `<div class="topbar">${canWrite() ? `<button type="button" class="newbar" data-new><span>➕ تسجيل أوردر جديد</span><small>${CFG.features.posLinked ? 'للأوردر اللي ملوش فاتورة' : 'سجّل بيانات الطلب وابدأ التوصيل'}</small></button>` : ''}<button type="button" class="newbar comm" data-comm><span>💰 عمولة الدليفري</span><small>اضغط لعرض عمولة كل مندوب</small></button></div>
+    <div class="lhead"><div><h2 style="display:inline">الأوردرات النشطة حالياً</h2><span class="pill">${act.length - needN} جاري توصيلها</span>${needN ? `<span class="pill am" data-goneed style="cursor:pointer">🧾 ${needN} محتاج مندوب ↓</span>` : ''}${lateN ? `<span class="pill red">⚠ ${lateN} عدّى ${CFG.promiseMin} دقيقة من الفاتورة</span>` : ''}${CFG.features.posLinked ? '<span class="pill sys" data-sys>⚪ …</span>' : ''}</div>
+      <button class="sndb ${ST.mute ? 'off' : ''}" data-mute>${muteLbl()}</button></div>
+    <div class="split">
+      <div class="pane need" id="needSec"><h3><span>🧾 مستنية تأكيد المندوب (${needN})</span></h3>
+        ${needN ? `<div class="stack">${needCards.join('')}</div>` : '<div class="empty">مفيش أوردرات مستنية</div>'}</div>
+      <div class="pane"><h3><span>🛵 جاري توصيلها (${outCards.length})</span></h3>
+        ${outGroups(act, cardArr) || '<div class="empty">مفيش أوردر جاري توصيله دلوقتي</div>'}</div>
+    </div>
+    ${ST.commOpen ? `<div class="mback" data-mback2><div class="mdl"><button type="button" class="mclose" data-closecomm title="إغلاق">✕</button>${commHtml()}</div></div>` : ''}
+    ${canWrite() && (ST.formOpen || EDIT) ? `<div class="mback" data-mback><div class="mdl"><button type="button" class="mclose" data-closeform title="إغلاق">✕</button>${formHtml()}</div></div>` : ''}`;
+}
+
+/* (7/11، طلبه) الجاري توصيلها متقسمة بكل مندوب + زرار إخفاء/إظهار لكل مندوب (بيتحفظ على الجهاز) */
+const HID = (() => { try { return new Set(JSON.parse(localStorage.getItem('delHid') || '[]')); } catch (e) { return new Set(); } })();
+function outGroups(act, cardArr) {
+  const g = new Map();
+  act.forEach((o, n) => { if (o.driverName) { if (!g.has(o.driverName)) g.set(o.driverName, []); g.get(o.driverName).push(cardArr[n]); } });
+  return [...g.entries()].sort((x, y) => String(x[0]).localeCompare(String(y[0]), 'ar')).map(([d, cs]) => {
+    const h = HID.has(d);
+    return `<div class="dgrp"><button type="button" class="dgh" data-hid="${esc(d)}"><b>🛵 ${esc(nm(d))}</b> <span class="pill">${cs.length}</span><span class="dgt">${h ? '👁 إظهار' : '🙈 إخفاء'}</span></button>${h ? '' : `<div class="tiles">${cs.join('')}</div>`}</div>`;
+  }).join('');
+}
+
+function asgCard(o, now) {
+  const a = ASG[o.id] || {}, min = Math.floor((now - o.startTime) / MIN), drs = drvList(), sug = suggestZone(o.district), zsel = a.zone !== undefined ? a.zone : sug;
+  const dly = o.importedAt ? `<span>⏱ نزل بعد ${Math.max(0, Math.round((o.importedAt - o.startTime) / 1000))} ث</span>` : '';
+  return `<div class="oc asg" data-id="${o.id}" data-start="${o.startTime}" data-bs="${o.startTime}" data-th="${LATE_SINGLE}" data-out="0" data-batch="0">
+    <div class="asgh"><h4>${esc(nm(o.customerName) || 'عميل بدون اسم')}</h4><span class="bg bat">من السيستم #${o.posId || ''}</span></div>
+    <div class="asgm">${o.district ? `<span>🏠 ${esc(o.district)}</span>` : ''}${o.employeeName ? `<span>👤 الموظف: ${esc(nm(o.employeeName))}</span>` : ''}${o.posEndTime ? `<span class="okc">✅ اتقفل في السيستم ${timeStr(o.posEndTime)}</span>` : ''}</div>
+    <div class="asgm asgt2">${dly}<span data-bd>🕒 منذ ${min} د</span><span>📅 ${dateStr(o.startTime)} · ${timeStr(o.startTime)}</span></div>
+    <div class="asgval"><small>قيمة الطلب</small><b>${M(o.orderValue)}</b></div>
+    ${canWrite() ? `<div class="asgbox">${canDrv() ? '<div><button type="button" class="lnk" data-adddrv>+ إضافة مندوب جديد</button></div>' : ''}<select data-asd="${o.id}"><option value="">-- اختر المندوب (إجباري) --</option>${drs.map(x => `<option ${a.drv === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>
+      <button type="button" class="brnbtn" data-brn="${o.id}">🏷 خصم عميل (من الفرع)</button>
+      <div class="zones" data-asz="${o.id}">
+        <button type="button" data-az="${ZONES[0]}" class="in ${zsel === ZONES[0] ? 'on' : ''}"><span class="ic">📍</span><span><b>${ZONES[0]}</b><small>من غير عمولة</small></span></button>
+        <button type="button" data-az="${ZONES[1]}" class="out ${zsel === ZONES[1] ? 'on' : ''}"><span class="ic">🧭</span><span><b>${ZONES[1]}</b><small>عمولة الدليفري ${COMM_OUT} ج</small></span></button></div>
+      <div class="btns"><button class="fin tq" data-asgo="${o.id}">🛵 تأكيد وبدء التوصيل</button><button class="del rd" data-rm="${o.id}">🗑 حذف</button></div></div>` : ''}</div>`;
+}
+
+async function assign(id) {
+  const o = findOrder(id); if (!o) return;
+  const a = ASG[id] || {}, sug = suggestZone(o.district), zone = a.zone !== undefined ? a.zone : sug;
+  if (!a.drv) { toast('اختار المندوب الأول'); return; }
+  if (!zone) { toast('لازم تختار المنطقة: داخل أو خارج النطاق'); const z = ROOT.querySelector(`[data-asz="${id}"]`); if (z) z.classList.add('miss'); return; }
+  const data = { driverName: a.drv, zone, assignedAt: Date.now(), zoneSug: sug };   // assignedAt = لحظة خروج المندوب · zoneSug = اللي اقترحه البرنامج (لقياس دقته)
+  if (o.posEndTime) Object.assign(data, { status: 'COMPLETED', endTime: o.posEndTime, endSource: 'pos', comm: commFor(zone) });   // الكاشير قفل التوصيل في السيستم قبل ما نحدد المندوب
+  try {
+    await updateDoc(doc(DB, 'deliv_orders', id), data); delete ASG[id]; beep(660, 1); if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); render();
+    logAct('assign', { ...o, ...data }, { who: isAdm() ? 'admin' : (localStorage.getItem('del_emp') || '') });
+    toast(o.posEndTime ? 'اتسجّل واتقفل (اتقفل في السيستم) ✔' : 'الأوردر بدأ 🛵');
+  } catch (e) { toast('مقدرتش: ' + (e.code || e.message)); }
+}
+
+// عمولة الدليفري باليوم: الأوردرات اللي اتسلّمت خارج النطاق في اليوم ده، لكل مندوب (المبلغ = comm المتخزن على كل أوردر)
+function commHtml() {
+  const today = opDay(Date.now()), day = ST.cday || today, per = new Map();
+  drvList().forEach(n => per.set(n, { c: 0, m: 0 }));
+  const k = day + '|' + day, c = HC.get(k);
+  const rows = day === today ? ORDERS.filter(o => o.status === 'COMPLETED') : ((c && c.rows) || []);
+  const loading = day !== today && !c;
+  rows.forEach(o => { if (o.endTime && o.driverName && isOut(o) && opDay(o.endTime) === day) { const x = per.get(o.driverName) || { c: 0, m: 0 }; x.c++; x.m += commOf(o); per.set(o.driverName, x); } });
+  const list = [...per.entries()].sort((a, b) => b[1].c - a[1].c), tc = list.reduce((s, r) => s + r[1].c, 0), tm = list.reduce((s, r) => s + r[1].m, 0);
+  return `<div class="cmm"><div class="lhead" style="border:0;margin-bottom:8px"><h2>💰 عمولة الدليفري — يوم ${+day.slice(8)}/${+day.slice(5, 7)} <small style="font-size:12px;color:#64748b;font-weight:600">(من ${DSP} لـ ${DSP})</small></h2>
+    <div class="cd"><label for="cDay">اليوم:</label><input type="date" id="cDay" value="${day}"></div></div>
+  ${loading ? '<div class="empty">⏳ جاري تحميل اليوم…</div>' : `<div class="tw" style="margin:0"><table><tr><th class="l">المندوب</th><th>أوردرات خارج النطاق اتسلّمت</th><th>العمولة</th></tr>
+  ${list.map(([n, x]) => `<tr><td class="l"><b style="color:#1e293b;font-size:14px">${esc(nm(n))}</b></td><td>${x.c}</td><td><b>${M(x.m)}</b></td></tr>`).join('') || '<tr><td colspan="3" class="empty">مفيش مناديب</td></tr>'}
+  ${list.length > 1 ? `<tr><td class="l"><b style="color:#1e293b">الإجمالي</b></td><td><b style="color:#1e293b">${tc}</b></td><td><b>${M(tm)}</b></td></tr>` : ''}</table></div>`}
+  <p class="hint">بتتحسب على الأوردرات اللي اتسلّمت خارج النطاق في اليوم ده، والمبلغ متخزن على كل أوردر وقت التسليم (${COMM_OUT} ج دلوقتي). اليوم بيبدأ ${DSL} وبيخلص ${DSL} اللي بعده، فالشيفت اللي بيعدّي نص الليل عمولته كلها في يوم واحد.</p></div>`;
+}
+
+/* ---------- نسخة Pro: موقع التسليم (بيتسجل من تطبيق المندوب عند ضغطة «تسليم») ---------- */
+const mapUrl = l => `https://www.google.com/maps?q=${l.lat},${l.lng}`;
+const LOCWHY = { denied: 'رفض الإذن', timeout: 'اتأخر', unavailable: 'GPS مش متاح' };
+function locCell(o) {
+  const l = o.deliveredLoc;
+  if (l && typeof l.lat === 'number' && typeof l.lng === 'number') return `<a href="${mapUrl(l)}" target="_blank" rel="noopener" title="دقة ±${N(l.acc)} متر">📍</a>${l.acc > 100 ? ` <span class="tag" title="دقة ضعيفة">⚠ ±${N(l.acc)}م</span>` : ''}`;
+  if (o.locStatus) return `<span class="tag" title="المندوب سلّم من غير موقع">${LOCWHY[o.locStatus] || '—'}</span>`;
+  return '—';   // اتقفل من الكاشير (مفيش موقع)
+}
+function gpsCard(list) {
+  const byDrv = list.filter(o => o.locStatus), withLoc = byDrv.filter(o => o.deliveredLoc).length, weak = byDrv.filter(o => o.deliveredLoc && o.deliveredLoc.acc > 100).length;
+  return `<div><div class="l">تسليمات من تطبيق المندوب · بموقع</div><div class="v">${N(withLoc)} من ${N(byDrv.length)}</div><div class="l">${weak ? `${N(weak)} بدقة ضعيفة (أكتر من 100 متر) · ` : ''}${N(list.length - byDrv.length)} اتقفلوا من الكاشير</div></div>`;
+}
+
+const rideCell = (o, b) => { const v = rideMs(o, b); return endSrc(o) === 'app' ? `<b>${durMin(v)}</b>` : `<span style="color:#94a3b8" title="اتقفل من السيستم — الوقت مش موثوق">${durMin(v)}*</span>`; };
+
+function statsHtml() {
+  const list = filtered(), bm = batchMap(pool(), Date.now()), ds = driverStats(list, bm);
+  const tot = list.length, tsum = list.reduce((s, o) => s + totMs(o), 0), late = list.filter(o => totMs(o) > PROMISE).length;
+  const val = list.reduce((s, o) => s + (o.orderValue || 0), 0), out = list.filter(isOut), comm = out.reduce((s, o) => s + commOf(o), 0);
+  const zs = list.filter(o => o.zoneSug), w = list.filter(o => o.source === 'pos' && o.assignedAt), wavg = w.length ? w.reduce((s, o) => s + (o.assignedAt - o.startTime), 0) / w.length : null;
+  const days = {}; list.forEach(o => { const k = opDay(o.endTime); (days[k] = days[k] || []).push(o); });
+  const rank = ds.filter(d => d.rn >= 3).sort((a, b) => a.rms / a.rn - b.rms / b.rn), few = ds.filter(d => d.rn > 0 && d.rn < 3);
+  return `${filterBar()}
+  <div class="dk"><div><div class="l">أوردرات اتسلّمت</div><div class="v">${N(tot)}</div></div>
+    <div><div class="l">متوسط الوقت من الفاتورة (اللي العميل شافه)</div><div class="v">${tot ? durMin(tsum / tot) : '—'}</div></div>
+    <div class="${late ? 'bad' : ''}"><div class="l">عدّى ${CFG.promiseMin} دقيقة من الفاتورة</div><div class="v">${N(late)}${tot ? ` <small>(${Math.round(late / tot * 100)}%)</small>` : ''}</div></div>
+    ${CFG.features.gps ? gpsCard(list) : ''}
+    ${CFG.features.posLinked ? `<div><div class="l">متوسط انتظار المندوب (من الفاتورة لحد الخروج)</div><div class="v">${wavg == null ? '—' : durMin(wavg)}</div><div class="l">${w.length ? N(w.length) + ' أوردر من السيستم' : 'لسه مفيش بيانات'}</div></div>` : ''}
+    <div><div class="l">قيمة الأوردرات</div><div class="v">${M(val)}</div></div>
+    ${CFG.features.posLinked ? `<div><div class="l">دقة اقتراح المنطقة من العنوان</div><div class="v">${zs.length ? Math.round(zs.filter(o => o.zone === o.zoneSug).length / zs.length * 100) + '%' : '—'}</div><div class="l">${zs.length ? `${zs.filter(o => o.zone === o.zoneSug).length} من ${zs.length} صح` : 'لسه بنجرب'}</div></div>` : ''}
+    <div style="border-inline-start-color:#f59e0b"><div class="l">خارج النطاق · عمولة الدليفري</div><div class="v">${N(out.length)} · ${M(comm)}</div></div></div>
+  <h3 class="sec">الطيارين</h3><div class="tw"><table><tr><th class="l">الطيار</th><th>أوردرات</th><th>متوسط من الفاتورة</th><th>متوسط من الخروج (مؤكد)</th><th>&lt;10</th><th>10–15</th><th>15–20</th><th>20–30</th><th>&gt;30</th><th>خارج النطاق</th><th>عمولة الدليفري</th><th>القيمة</th></tr>
+  ${ds.map(d => `<tr><td class="l"><b>${esc(nm(d.n))}</b></td><td>${d.c}</td><td>${d.c ? durMin(d.tms / d.c) : '—'}</td><td>${d.rn ? `${durMin(d.rms / d.rn)} <small style="color:#94a3b8">(${d.rn})</small>` : '—'}</td>${d.b.map((x, i) => `<td ${i === 4 && x ? 'style="color:#C0392B;font-weight:800"' : ''}>${x}</td>`).join('')}<td>${d.out}${d.out ? ` (${M(d.outVal)})` : ''}</td><td><b style="color:#b45309">${M(d.comm)}</b></td><td>${M(d.val)}</td></tr>`).join('') || '<tr><td colspan="12" class="empty">مفيش بيانات في الفترة دي</td></tr>'}</table></div>
+  <p class="sub">الأرقام بين القوسين = عدد الأوردرات اللي اتقفلت بضغطة «تسليم» من التطبيق. اللي اتقفل من ${CFG.posName} وقته مش موثوق فمبيدخلش في «من الخروج» ولا في الترتيب.</p>
+  <h3 class="sec">🏆 ترتيب المناديب (الأسرع من الخروج للتسليم)</h3><div class="tw"><table><tr><th>#</th><th class="l">المندوب</th><th>تسليمات مؤكدة</th><th>متوسط من الخروج</th><th>عدّى ${CFG.promiseMin} د من الفاتورة</th></tr>
+  ${rank.map((d, i) => `<tr><td>${['🥇', '🥈', '🥉'][i] || i + 1}</td><td class="l"><b>${esc(nm(d.n))}</b></td><td>${d.rn}</td><td><b>${durMin(d.rms / d.rn)}</b></td><td ${d.b[4] ? 'style="color:#dc2626;font-weight:800"' : ''}>${d.b[4]} (${Math.round(d.b[4] / d.c * 100)}%)</td></tr>`).join('') || '<tr><td colspan="5" class="empty">محتاج 3 تسليمات مؤكدة (ضغطة «تسليم») على الأقل لكل مندوب علشان يدخل الترتيب</td></tr>'}</table></div>
+  ${few.length ? `<p class="sub">ناقصهم تسليمات مؤكدة: ${few.map(d => `${esc(nm(d.n))} (${d.rn})`).join('، ')}</p>` : ''}
+  <h3 class="sec">يوم بيوم</h3><div class="tw"><table><tr><th class="l">اليوم</th><th>أوردرات</th><th>متوسط من الفاتورة</th><th>&gt;${CFG.promiseMin} د</th><th>خارج النطاق</th><th>عمولة الدليفري</th><th>القيمة</th></tr>
+  ${Object.keys(days).sort().reverse().map(k => { const a = days[k], t = a.reduce((s, o) => s + totMs(o), 0), ou = a.filter(isOut); return `<tr><td class="l">${k.slice(8)}/${k.slice(5, 7)}</td><td>${a.length}</td><td>${durMin(t / a.length)}</td><td>${a.filter(o => totMs(o) > PROMISE).length}</td><td>${ou.length}</td><td><b style="color:#b45309">${M(ou.reduce((s, o) => s + commOf(o), 0))}</b></td><td>${M(a.reduce((s, o) => s + (o.orderValue || 0), 0))}</td></tr>`; }).join('') || '<tr><td colspan="7" class="empty">—</td></tr>'}</table></div>
+  <div class="ctl"><button class="ghost" data-xl>📥 تنزيل إكسل (السجل + الطيارين)</button><button class="ghost" data-rep>📋 نسخ تقرير للواتساب</button><button class="ghost" data-reload>🔄 تحديث الأرقام</button></div>
+  <p class="sub">اتحمّل ${N(HIST.length)} أوردر للفترة دي (بيتحفظوا 10 دقايق، والتحديث بيقرا من جديد).</p>`;
+}
+
+function logHtml() {
+  const list = filtered().sort((a, b) => b.endTime - a.endTime), bm = batchMap(pool(), Date.now()), shown = list.slice(0, ST.shown);
+  return `${filterBar()}<div class="tw"><table><tr><th class="l">اليوم</th><th>الفاتورة</th><th>خرج</th><th>وصل</th><th>من الفاتورة</th><th>من الخروج</th><th class="l">الطيار</th><th class="l">العميل</th><th>المنطقة</th><th>عمولة</th><th>القيمة</th><th>الدفع</th><th class="l">سجّله</th>${CFG.features.gps ? '<th>الموقع</th>' : ''}${isAdm() ? '<th></th>' : ''}</tr>
+  ${shown.map(o => { const b = bm.get(o.id), t = totMs(o), late = t > PROMISE;
+    return `<tr class="${late ? 'late' : ''}"><td class="l">${dayLbl(o.endTime)}</td><td>${timeStr(o.startTime)}</td><td>${o.assignedAt ? timeStr(o.assignedAt) : '—'}</td><td>${timeStr(o.endTime)}${endSrc(o) === 'pos' ? '*' : ''}</td><td><b>${durMin(t)}</b></td><td>${rideCell(o, b)}${b && b.batch ? ` <span class="tag b">طلعة ${b.size}</span>` : ''}</td><td class="l">${esc(nm(o.driverName))}</td><td class="l">${esc(o.customerName || '—')}${o.notes ? ' 📝' : ''}</td><td>${isOut(o) ? `<span class="tag o">${esc(ZONES[1])}</span>` : `<span class="tag i">${esc(ZONES[0])}</span>`}</td><td>${isOut(o) ? M(commOf(o)) : '—'}</td><td>${M(o.orderValue)}</td><td>${o.isVisa ? 'فيزا' : o.isVodafoneCash ? 'فودافون' : 'كاش'}</td><td class="l">${esc(nm(o.employeeName) || '—')}</td>${CFG.features.gps ? `<td>${locCell(o)}</td>` : ''}${isAdm() ? `<td><button class="ghost sm" data-ed="${o.id}">✏️</button> <button class="ghost sm" data-rc="${o.id}">🧾</button> <button class="ghost sm" data-rm="${o.id}">🗑️</button></td>` : ''}</tr>`; }).join('') || `<tr><td colspan="15" class="empty">مفيش أوردرات في الفترة دي</td></tr>`}</table></div>
+  ${list.length > ST.shown ? `<button class="ghost" data-more>عرض المزيد (${list.length - ST.shown})</button>` : ''}<p class="sub">${N(list.length)} أوردر في الفترة · الصف الأحمر = عدّى ${CFG.promiseMin} دقيقة من الفاتورة · * = اتقفل من ${CFG.posName} (الوقت مش موثوق).</p>`;
+}
+
+function filterBar() {
+  const P = [['today', 'النهارده'], ['yest', 'إمبارح'], ['7', 'آخر 7 أيام'], ['month', 'الشهر ده'], ['all', 'آخر 90 يوم'], ['custom', 'من – إلى']];
+  return `<div class="ctl chips">${P.map(p => `<button class="chip ${ST.period === p[0] ? 'on' : ''}" data-p="${p[0]}">${p[1]}</button>`).join('')}</div>
+  <p class="sub" style="margin:0 0 8px">اليوم = من ${DSL} لـ ${DSL} اللي بعده.</p>
+  <div class="ctl">${ST.period === 'custom' ? `<input type="date" id="fFrom" value="${ST.from}"><input type="date" id="fTo" value="${ST.to}">` : ''}
+    <select id="fDrv"><option value="">كل الطيارين</option>${drvList().map(d => `<option ${ST.driver === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select>
+    <select id="fZone"><option value="">كل المناطق</option>${ZONES.map(z => `<option ${ST.zone === z ? 'selected' : ''}>${esc(z)}</option>`).join('')}</select></div>`;
+}
+
+/* ---------- سجل التغييرات (deliv_log) — للأدمن وصاحب الصيدلية، بيتسحب عند الفتح بس (150 سطر) ---------- */
+let AUD = null;
+const AUD_ACT = { assign: 'تعيين مندوب', edit: 'تعديل', delete: 'حذف', branch: 'خصم عميل' }, AUD_F = { driverName: 'المندوب', zone: 'المنطقة', orderValue: 'القيمة', customerName: 'العميل', notes: 'ملاحظات', isVisa: 'فيزا', isVodafoneCash: 'فودافون كاش', changeGiven: 'الفكة', employeeName: 'الموظف', comm: 'العمولة', assignedAt: 'خروج المندوب' };
+function audEnsure() {
+  if (ST.audLoading || (AUD && Date.now() - AUD.at < 120000)) return;
+  ST.audLoading = true;
+  getDocs(query(collection(DB, 'deliv_log'), orderBy('at', 'desc'), limit(150)))
+    .then(s => { AUD = { at: Date.now(), rows: s.docs.map(d => ({ id: d.id, ...d.data() })) }; })
+    .catch(e => { toast('سجل التغييرات: ' + (e.code || e.message)); AUD = { at: Date.now(), rows: [], err: 1 }; })
+    .finally(() => { ST.audLoading = false; safeRender(); });
+}
+function audHtml() {
+  const f = ST.audAct || '', rows = ((AUD && AUD.rows) || []).filter(r => !f || r.act === f);
+  const chips = [['', 'الكل'], ['assign', 'تعيين'], ['edit', 'تعديل'], ['delete', 'حذف'], ['branch', 'خصم عميل']].map(c => `<button class="chip ${f === c[0] ? 'on' : ''}" data-aa="${c[0]}">${c[1]}</button>`).join('');
+  if (!AUD) return `<div class="ctl chips">${chips}</div><div class="empty">⏳ جاري تحميل السجل…</div>`;
+  const tms = r => { const a = r.at; const t = a && a.toMillis ? a.toMillis() : (a && a.seconds ? a.seconds * 1000 : 0); return t; };
+  const val = v => v === true ? 'نعم' : v === false ? 'لا' : v == null || v === '' ? '—' : (typeof v === 'number' && v > 1e12) ? timeStr(v) : String(v);
+  return `<div class="ctl chips">${chips}<button class="chip" data-aref>🔄 تحديث</button></div>
+  <div class="tw"><table><tr><th class="l">الوقت</th><th>العملية</th><th class="l">مين عملها</th><th class="l">الأوردر</th><th class="l">التفاصيل</th></tr>
+  ${rows.map(r => {
+    let o = {}, d = {}; try { o = r.full ? JSON.parse(r.full) : {}; } catch (e) { } try { d = r.d ? JSON.parse(r.d) : {}; } catch (e) { }
+    const t = tms(r), open = ST.audOpen && ST.audOpen[r.id];
+    const det = r.act === 'edit' ? Object.keys(d).map(k => `${AUD_F[k] || k}: ${val(d[k][0])} ← <b>${val(d[k][1])}</b>`).join('<br>') || '—'
+      : r.act === 'assign' ? `${esc(nm(o.driverName))} · ${esc(o.zone || '')}${o.endSource === 'pos' ? ' · اتقفل من السيستم' : ''}`
+      : `<button class="chip" data-ao="${r.id}">${open ? 'إخفاء' : 'نسخة المحذوف'}</button>${open ? `<pre dir="ltr" style="white-space:pre-wrap;text-align:left;font-size:11px;margin:6px 0 0">${esc(JSON.stringify(o, null, 1))}</pre>` : ''}`;
+    return `<tr${r.act === 'delete' ? ' class="late"' : ''}><td class="l">${t ? dateStr(t) + ' ' + timeStr(t) : '—'}</td><td><span class="tag ${r.act === 'delete' ? 'o' : r.act === 'edit' ? 'b' : 'i'}">${AUD_ACT[r.act] || esc(r.act)}</span></td><td class="l">${esc(r.who || '—')}</td><td class="l">${esc(nm(o.driverName) || '—')} ← ${esc(o.customerName || 'عميل')} · ${M(o.orderValue)}${o.posId ? ` <span class="cu">#${o.posId}</span>` : ''}</td><td class="l" style="white-space:normal;min-width:200px">${det}</td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="empty">مفيش تغييرات متسجلة لسه</td></tr>'}</table></div>
+  <p class="sub">آخر ${N(((AUD && AUD.rows) || []).length)} حركة (بتتحمّل عند فتح التبويب بس). الحذف بيحفظ نسخة كاملة من الأوردر هنا. التسليم العادي مش بيتسجل هنا (موجود في السجل).</p>`;
+}
+
+/* ---------- الأحداث ---------- */
+function bind() {
+  ROOT.querySelectorAll('[data-p]').forEach(b => b.onclick = () => { ST.period = b.dataset.p; ST.shown = 60; render(); });
+  [['fFrom', 'from'], ['fTo', 'to'], ['fDrv', 'driver'], ['fZone', 'zone']].forEach(([id, k]) => { const e = $('#' + id, ROOT); if (e) e.onchange = () => { ST[k] = e.value; ST.shown = 60; render(); }; });
+  ROOT.querySelectorAll('[data-asd]').forEach(sel => sel.onchange = () => { (ASG[sel.dataset.asd] = ASG[sel.dataset.asd] || {}).drv = sel.value; });
+  ROOT.querySelectorAll('[data-az]').forEach(b => b.onclick = () => {
+    const box = b.closest('[data-asz]'), id = box.dataset.asz;
+    (ASG[id] = ASG[id] || {}).zone = b.dataset.az; box.classList.remove('miss');
+    box.querySelectorAll('[data-az]').forEach(x => x.classList.toggle('on', x === b));
+  });
+  ROOT.querySelectorAll('[data-asgo]').forEach(b => b.onclick = () => assign(b.dataset.asgo));
+  ROOT.querySelectorAll('[data-aa]').forEach(b => b.onclick = () => { ST.audAct = b.dataset.aa; render(); });
+  const ar = $('[data-aref]', ROOT); if (ar) ar.onclick = () => { AUD = null; render(); };
+  ROOT.querySelectorAll('[data-ao]').forEach(b => b.onclick = () => { ST.audOpen = ST.audOpen || {}; ST.audOpen[b.dataset.ao] = !ST.audOpen[b.dataset.ao]; render(); });
+  const rl = $('[data-reload]', ROOT); if (rl) rl.onclick = () => { HC.delete(periodRange().join('|')); ST.histKey = ''; render(); };
+  const ws = $('#whoSel', ROOT); if (ws) ws.onchange = () => { ST.ask.sel = ws.value; };
+  const wo = $('[data-whook]', ROOT); if (wo) wo.onclick = () => { const v = ($('#whoSel', ROOT).value || '').trim(); if (!v) { toast('اختار اسمك الأول'); return; } localStorage.setItem('del_emp', v); const a = ST.ask; ST.ask = null; render(); a.res(v); };
+  const wn = $('[data-whono]', ROOT); if (wn) wn.onclick = () => { const a = ST.ask; ST.ask = null; render(); a.res(null); };
+  const cd = $('#cDay', ROOT); if (cd) cd.onchange = () => { ST.cday = cd.value; render(); };
+  const more = $('[data-more]', ROOT); if (more) more.onclick = () => { ST.shown += 100; render(); };
+  const xl = $('[data-xl]', ROOT); if (xl) xl.onclick = exportXl;
+  const rp = $('[data-rep]', ROOT); if (rp) rp.onclick = copyReport;
+  ROOT.querySelectorAll('[data-fin]').forEach(b => b.onclick = () => finish(b.dataset.fin));
+  ROOT.querySelectorAll('[data-rc]').forEach(b => b.onclick = () => receipt(b.dataset.rc));
+  ROOT.querySelectorAll('[data-ed]').forEach(b => b.onclick = () => { EDIT = b.dataset.ed; ST.formOpen = true; ST.view = 'live'; render(); });
+  const nb = $('[data-new]', ROOT); if (nb) nb.onclick = () => { EDIT = null; ST.formOpen = true; render(); setTimeout(() => { const e = $('#dEmp', ROOT); if (e) e.focus(); }, 50); };
+  const gn = $('[data-goneed]', ROOT); if (gn) gn.onclick = () => { const e = $('#needSec', ROOT); if (e) e.scrollIntoView({ behavior: 'smooth', block: 'start' }); };
+  const closeForm = () => { ST.formOpen = false; EDIT = null; render(); };
+  const mb = $('[data-mback]', ROOT); if (mb) mb.onclick = e => { if (e.target === mb) closeForm(); };
+  const cf = $('[data-closeform]', ROOT); if (cf) cf.onclick = closeForm;
+  const cb = $('[data-comm]', ROOT); if (cb) cb.onclick = () => { ST.commOpen = true; render(); };
+  const closeComm = () => { ST.commOpen = false; render(); };
+  const mb2 = $('[data-mback2]', ROOT); if (mb2) mb2.onclick = e => { if (e.target === mb2) closeComm(); };
+  const cc = $('[data-closecomm]', ROOT); if (cc) cc.onclick = closeComm;
+  ROOT.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => remove(b.dataset.rm));
+  ROOT.querySelectorAll('[data-brn]').forEach(b => b.onclick = () => branchOrder(b.dataset.brn));
+  ROOT.querySelectorAll('[data-adddrv]').forEach(b => b.onclick = addDrv);
+  const f = $('#dForm', ROOT); if (!f) return;
+  f.querySelectorAll('[data-z]').forEach(b => b.onclick = () => { f.querySelectorAll('[data-z]').forEach(x => x.classList.remove('on')); b.classList.add('on'); $('#dZone', f).classList.remove('miss'); draft(); });
+  f.addEventListener('input', draft); f.addEventListener('change', draft);
+  f.querySelectorAll('.pay input').forEach(i => i.onchange = () => i.closest('.pay').classList.toggle('on', i.checked));
+  $('#dGo', f).onclick = save;
+  const c = $('#dCancel', f); if (c) c.onclick = closeForm;
+  const dd = $('[data-deldrv]', f); if (dd) dd.onclick = delDrv;
+}
+
+function draft() {
+  if (EDIT) return;
+  const g = id => { const e = $('#' + id, ROOT); return e ? e : { value: '', checked: false }; }, z = ROOT.querySelector('[data-z].on');
+  DR = { emp: g('dEmp').value, drv: g('dDrv').value, cus: g('dCus').value, zone: z ? z.dataset.z : '', val: g('dVal').value, chg: g('dChg').value, visa: g('dVisa').checked, voda: g('dVoda').checked, note: g('dNote').value };
+}
+
+async function save() {
+  const err = $('#dErr'), g = id => $('#' + id, ROOT), emp = g('dEmp').value, drv = g('dDrv').value;
+  const e0 = EDIT ? findOrder(EDIT) : null, lock = !!(e0 && e0.driverName && !isAdm());
+  const z = lock ? { dataset: { z: e0.zone } } : ROOT.querySelector('[data-z].on');
+  err.textContent = '';
+  if (!emp) { err.textContent = 'اختار الموظف اللي سجّل الأوردر'; return; }
+  if (!drv) { err.textContent = 'مفيش طيار — ضيف طيار الأول'; return; }
+  if (!z) { err.textContent = 'لازم تختار المنطقة: داخل النطاق ولا خارج النطاق'; $('#dZone', ROOT).classList.add('miss'); $('#dZone', ROOT).scrollIntoView({ block: 'center', behavior: 'smooth' }); return; }
+  const val = lock ? e0.orderValue : (parseFloat(g('dVal').value) || 0), chg = parseFloat(g('dChg').value) || 0;
+  if (val < 0 || val >= 100000 || chg < 0) { err.textContent = 'راجع القيمة'; return; }
+  const data = { driverName: drv, customerName: g('dCus').value.trim(), employeeName: emp, zone: z.dataset.z, orderValue: val, changeGiven: chg,
+    isVisa: g('dVisa').checked, isVodafoneCash: g('dVoda').checked, notes: g('dNote').value.trim() };
+  try {
+    localStorage.setItem('del_emp', emp);
+    if (EDIT) {
+      if (e0 && e0.status === 'COMPLETED') data.comm = commFor(data.zone);                       // أدمن بيعدّل أوردر اتسلّم ← العمولة تتظبط مع المنطقة
+      if (e0 && !e0.assignedAt && e0.driverName === '' && drv) data.assignedAt = Date.now();      // أوردر من السيستم اتحدد له مندوب من التعديل
+      const nz = (k, v) => (k === 'isVisa' || k === 'isVodafoneCash') ? !!v : (v ?? ''), d = {}; Object.keys(data).forEach(k => { if (e0 && String(nz(k, e0[k])) !== String(nz(k, data[k]))) d[k] = [nz(k, e0[k]) === '' ? null : nz(k, e0[k]), data[k]]; });
+      await updateDoc(doc(DB, 'deliv_orders', EDIT), data); logAct('edit', e0, { who: isAdm() ? 'admin' : emp, d }); patchLocal(EDIT, data);
+      EDIT = null; ST.formOpen = false; toast('اتعدّل ✔');
+    } else {
+      const now = Date.now(), ref = doc(collection(DB, 'deliv_orders'));
+      await setDoc(ref, { ...data, startTime: now, assignedAt: now, createdAt: serverTimestamp(), endTime: null, status: 'PENDING', source: 'manual', by: UID });
+      beep(660, 1); toast('الأوردر بدأ 🛵'); DR = {}; ST.formOpen = false;
+    }
+    render();
+  } catch (e) { err.textContent = 'مقدرتش أحفظ: ' + (e.code || e.message); }
+}
+function patchLocal(id, data) {   // أوردر في الفترة المحمّلة (مش في الاستماع الحي) ← نحدّثه محلياً
+  const apply = o => o.id === id ? { ...o, ...data } : o;
+  HIST = HIST.map(apply); HC.forEach(c => { c.rows = c.rows.map(apply); });
+}
+async function finish(id) {
+  const o = findOrder(id); if (!o) return;
+  try {
+    await updateDoc(doc(DB, 'deliv_orders', id), { status: 'COMPLETED', endTime: Date.now(), endSource: 'app', comm: commFor(o.zone) });
+    beep(990, 2); toast('تم التسليم ✔'); if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); render();
+  } catch (e) { toast('مقدرتش: ' + (e.code || e.message)); }
+}
+async function branchOrder(id) {   // (9/11، طلبه) فاتورة اتحفظت توصيل بس العميل في الفرع (خصم) ← تتشال من الدليفري وتتسجل «خصم عميل»
+  const o = findOrder(id); if (!o || o.driverName) return;
+  let who = 'admin';
+  if (!isAdm()) { who = await askWho(`الأوردر ده خصم عميل في الفرع (مش توصيل): ${o.customerName || 'عميل'} (${M(o.orderValue)}) — يتشال من الدليفري؟`); if (!who) return; }
+  else if (!confirm(`الأوردر ده خصم عميل في الفرع (مش توصيل)؟ هيتشال من الدليفري.
+${o.customerName || 'عميل'} (${M(o.orderValue)})`)) return;
+  try {
+    await logAct('branch', o, { who });
+    await deleteDoc(doc(DB, 'deliv_orders', id));
+    HIST = HIST.filter(x => x.id !== id); HC.forEach(c => { c.rows = c.rows.filter(x => x.id !== id); });
+    toast('اتشال — خصم عميل ✔'); render();
+  } catch (e) { toast('مقدرتش: ' + (e.code || e.message)); }
+}
+async function remove(id) {
+  const o = findOrder(id); if (!o) return;
+  let who = 'admin';
+  if (!isAdm()) { who = await askWho(`حذف أوردر ${nm(o.driverName) || 'من غير مندوب'} ← ${o.customerName || 'عميل'} (${M(o.orderValue)})`); if (!who) return; }
+  else if (!confirm(`تمسح الأوردر ده نهائي؟\n${nm(o.driverName)} ← ${o.customerName || 'عميل'} (${M(o.orderValue)})`)) return;
+  try {
+    await logAct('delete', o, { who });                      // نسخة كاملة في deliv_log قبل المسح
+    await deleteDoc(doc(DB, 'deliv_orders', id));
+    HIST = HIST.filter(x => x.id !== id); HC.forEach(c => { c.rows = c.rows.filter(x => x.id !== id); });
+    trashSound(); toast('اتمسح'); render();
+  } catch (e) { toast('مقدرتش أمسح: ' + (e.code || e.message) + (e.code === 'permission-denied' ? ' — بعد تأكيد المندوب الحذف من الأدمن' : '')); }
+}
+async function addDrv() {
+  const n = (prompt('اسم الطيار الجديد:') || '').trim(); if (!n) return;
+  if (drvList().includes(n)) { toast('الطيار ده موجود'); return; }
+  try { const r = await addDoc(collection(DB, 'deliv_drivers'), { name: n }); DRIVERS.push({ id: r.id, name: n }); toast('اتضاف ✔'); render(); } catch (e) { toast('مقدرتش أضيف المندوب: ' + (e.code || e.message)); }
+}
+async function delDrv() {
+  const n = $('#dDrv', ROOT).value, d = DRIVERS.find(x => x.name === n);
+  if (!d) { toast('الطيار ده مش في القايمة (متسجل على أوردرات قديمة بس)'); return; }
+  if (!confirm(`تشيل الطيار «${n}» من القايمة؟ أوردراته القديمة هتفضل في السجل.`)) return;
+  try { await deleteDoc(doc(DB, 'deliv_drivers', d.id)); DRIVERS = DRIVERS.filter(x => x.id !== d.id); toast('اتشال'); render(); } catch (e) { toast('مقدرتش: ' + (e.code || e.message)); }
+}
+
+function receipt(id) {
+  const o = findOrder(id); if (!o) return;
+  const w = window.open('', '_blank', 'width=380,height=620'); if (!w) { toast('المتصفح قافل النافذة — اسمح بالـ popups'); return; }
+  const pay = o.isVisa ? 'فيزا' : o.isVodafoneCash ? 'فودافون كاش' : 'كاش';
+  w.document.write(`<!doctype html><meta charset="utf-8"><title>إيصال</title><body dir="rtl" style="font-family:Tahoma,sans-serif;width:72mm;margin:0 auto;padding:6px;font-size:13px;color:#000">
+  <h3 style="text-align:center;margin:4px 0">${esc(CFG.name)}</h3><div style="text-align:center;font-size:11px">${esc(CFG.receiptSub)}</div><hr>
+  <div>التاريخ: ${dateStr(o.startTime)} — ${timeStr(o.startTime)}</div><div>العميل: ${esc(o.customerName || '—')}</div><div>المنطقة: ${esc(isOut(o) ? ZONES[1] : ZONES[0])}</div>${isOut(o) ? `<div>عمولة الدليفري: ${COMM_OUT} ج</div>` : ''}
+  <div>الطيار: ${esc(nm(o.driverName))}</div><div>الدفع: ${pay}</div><hr>
+  <div style="font-size:17px;font-weight:bold">الإجمالي: ${N(o.orderValue)} ج</div>${o.changeGiven ? `<div>فكة مع الطيار: ${N(o.changeGiven)} ج</div>` : ''}${o.notes ? `<div>ملاحظات: ${esc(o.notes)}</div>` : ''}<hr>
+  <div style="text-align:center">شكراً لثقتكم 🌿</div><script>onload=()=>{print()}<\/script>`);
+  w.document.close();
+}
+
+function copyReport() {
+  const list = filtered(), bm = batchMap(pool(), Date.now()), ds = driverStats(list, bm).filter(d => d.c), [a, b] = periodRange();
+  const tot = list.length, tsum = list.reduce((x, o) => x + totMs(o), 0), late = list.filter(o => totMs(o) > PROMISE).length;
+  const lbl = k => `${+k.slice(8)}/${+k.slice(5, 7)}`, per = a === b ? `يوم ${lbl(a)}` : `من ${lbl(a)} لـ ${lbl(b)}`;
+  const t = [`📋 تقرير الدليفري — ${per} (${DSN}–${DSN})`, `✅ اتسلّم ${tot} أوردر · متوسط الوقت من الفاتورة ${tot ? durMin(tsum / tot) : '—'} · عدّى ${CFG.promiseMin} دقيقة: ${late}`, `💵 قيمة الأوردرات: ${M(list.reduce((x, o) => x + (o.orderValue || 0), 0))}`, '',
+    '🛵 المناديب:', ...ds.map(d => `• ${nm(d.n)}: ${d.c} أوردر (${d.out} خارج النطاق) · متوسط ${durMin(d.tms / d.c)} · عمولة ${M(d.comm)}`),
+    '', `💰 إجمالي عمولة الدليفري: ${M(list.filter(isOut).reduce((x, o) => x + commOf(o), 0))}`].join('\n');
+  (navigator.clipboard ? navigator.clipboard.writeText(t).then(() => toast('اتنسخ — الصقه في الواتساب ✔')) : Promise.reject()).catch(() => prompt('انسخ التقرير:', t));
+}
+
+function exportXl() {
+  if (!window.XLSX) { toast('مكتبة الإكسل مش محملة'); return; }
+  const list = filtered().sort((a, b) => a.endTime - b.endTime), bm = batchMap(pool(), Date.now());
+  const log = [['اليوم التشغيلي (' + DSN + '–' + DSN + ')', 'وقت الفاتورة/التسجيل', 'خروج المندوب', 'وقت التسليم', 'مصدر وقت التسليم', 'من الفاتورة (دقيقة)', 'من الخروج (دقيقة)', 'طلعة مجمعة (عدد)', 'الطيار', 'العميل', 'المنطقة', 'القيمة', 'الفكة', 'الدفع', 'عمولة الدليفري', 'سجّله', 'ملاحظات', ...(CFG.features.gps ? ['خط العرض', 'خط الطول', 'دقة الموقع (متر)', 'حالة الموقع'] : [])]]
+    .concat(list.map(o => { const b = bm.get(o.id); return [opDay(o.endTime), timeStr(o.startTime), o.assignedAt ? timeStr(o.assignedAt) : '', timeStr(o.endTime), endSrc(o) === 'app' ? 'تطبيق' : CFG.posName, +(totMs(o) / MIN).toFixed(1), +(rideMs(o, b) / MIN).toFixed(1), b && b.batch ? b.size : 1, o.driverName, o.customerName, zoneName(o.zone), o.orderValue, o.changeGiven, o.isVisa ? 'فيزا' : o.isVodafoneCash ? 'فودافون كاش' : 'كاش', commOf(o), o.employeeName, o.notes, ...(CFG.features.gps ? [o.deliveredLoc ? o.deliveredLoc.lat : '', o.deliveredLoc ? o.deliveredLoc.lng : '', o.deliveredLoc ? o.deliveredLoc.acc : '', o.locStatus || (endSrc(o) === 'app' ? 'من الكاشير' : '')] : [])]; }));
+  const drv = [['الطيار', 'أوردرات', 'متوسط من الفاتورة (دقيقة)', 'تسليمات مؤكدة', 'متوسط من الخروج (دقيقة، مؤكد)', 'أقل من 10', '10–15', '15–20', '20–30', 'أكتر من 30', 'خارج النطاق (عدد)', 'خارج النطاق (قيمة)', 'عمولة الدليفري', 'القيمة']]
+    .concat(driverStats(list, bm).map(d => [d.n, d.c, d.c ? +(d.tms / d.c / MIN).toFixed(1) : 0, d.rn, d.rn ? +(d.rms / d.rn / MIN).toFixed(1) : '', ...d.b, d.out, d.outVal, d.comm, d.val]));
+  const how = [['طريقة الحساب'],
+    ['من الفاتورة = وقت التسليم − وقت الفاتورة (أو التسجيل اليدوي). ده اللي العميل شافه، وعليه وعد الـ30 دقيقة.'],
+    ['من الخروج = وقت التسليم − وقت تأكيد المندوب (خروجه). بيتحسب بس للأوردرات اللي اتقفلت بضغطة «تسليم» من التطبيق، لأن وقت «إتمام التوصيل» في ' + CFG.posName + ' مش موثوق.'],
+    ['الطلعة المجمعة: أوردرات نفس المندوب اتأكدت في خلال 5 دقايق = طلعة واحدة، ونصيب كل أوردر من وقت الخروج = وقت الطلعة ÷ عدد الأوردرات.'],
+    ['مثال: مندوب اتأكد له أوردرين 3:00 و3:02 ورجع 3:40 → 40 دقيقة ÷ 2 = 20 دقيقة لكل أوردر.'],
+    ['"أكتر من ' + CFG.promiseMin + '" = الأوردر اللي عدّى وعد التوصيل (' + CFG.promiseMin + ' دقيقة من الفاتورة).'],
+    ['عمولة الدليفري = المتخزن على الأوردر وقت التسليم (' + COMM_OUT + ' ج لكل أوردر اتسلّم خارج النطاق). مثال: 8 أوردرات خارج النطاق = 8 × ' + COMM_OUT + ' = ' + (8 * COMM_OUT) + ' ج.'],
+    ['الفترة: ' + periodRange().join(' → ')], ['اليوم التشغيلي بيبدأ ' + DSL + ' وبيخلص ' + DSL + ' اللي بعده.']];
+  const wb = XLSX.utils.book_new();
+  [['طريقة الحساب', how], ['الطيارين', drv], ['السجل', log]].forEach(([n, r]) => XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(r), n));
+  XLSX.writeFile(wb, `دليفري_${opDay(Date.now())}.xlsx`);
+}
+
+/* ---------- تايمر ---------- */
+function tick() {
+  const now = Date.now();
+  const sy = ROOT.querySelector('[data-sys]');
+  if (sy) {
+    if (!SYS || !SYS.at) { sy.textContent = '⚪ لسه مفيش إشارة من سيرفر الفواتير'; sy.className = 'pill sys'; }
+    else { const ag = Math.max(0, Math.round((now - SYS.at) / 1000));
+      if (ag < 150) { sy.textContent = `🟢 سيرفر الفواتير شغال (آخر فحص من ${ag < 90 ? ag + ' ث' : Math.round(ag / 60) + ' د'})${SYS.src ? ' · ' + (SYS.src === 'task' ? 'مهمة مستقلة' : 'نسخة احتياطية') : ''}`; sy.className = 'pill sys ok'; sy.title = SYS.started ? `اللوب شغال من ${dateStr(SYS.started)} ${timeStr(SYS.started)}` : ''; }
+      else { sy.textContent = `🔴 سيرفر الفواتير واقف من ${Math.round(ag / 60)} دقيقة — الفواتير مش بتنزل`; sy.className = 'pill sys bad'; } }
+  }
+  const mb = ROOT.querySelector('[data-mute]'); if (mb) { const l = muteLbl(); if (mb.textContent !== l) mb.textContent = l; }
+  ROOT.querySelectorAll('.oc[data-start]').forEach(c => {
+    const out = c.dataset.out === '1', min = Math.floor((now - +c.dataset.start) / MIN);
+    const late = !out && now - +c.dataset.bs >= +c.dataset.th, warn = min >= 20;
+    const bd = c.querySelector('[data-bd]'); if (bd) { bd.textContent = c.classList.contains('tile') ? `🕒 ${min} د` : `🕒 منذ ${min} د${out ? ' · بدون إنذار' : ''}`; bd.className = 'bd ' + (late ? 'late' : out ? 'out' : warn ? 'warn' : ''); }
+    const rd = c.querySelector('[data-rd]'); if (rd && c.dataset.as) rd.textContent = `خرج من ${Math.floor((now - +c.dataset.as) / MIN)} د`;
+    if (late !== c.classList.contains('late')) {
+      c.classList.toggle('late', late);
+      const lt = c.querySelector('[data-lt]'); if (lt) { lt.className = late ? 'bg red' : ''; lt.textContent = late ? (c.classList.contains('tile') ? '⚠ متأخر' : `⚠ متأخر (+${+c.dataset.th / MIN} د)`) : ''; }
+    }
+    if (late && !ALARMED.has(c.dataset.id)) { ALARMED.add(c.dataset.id); beep(1200, 4); }
+  });
+}
+
+function subDone() {   // اللي اتسلّم من 9 الصبح (اليوم التشغيلي الحالي) — بيتجدد لما اليوم يتغير
+  if (UDONE) UDONE();
+  ST.liveDay = opDay(Date.now());
+  UDONE = onSnapshot(query(collection(DB, 'deliv_orders'), where('endTime', '>=', cairoStart(ST.liveDay))), s => {
+    DONE = new Map(s.docs.map(d => [d.id, { id: d.id, ...d.data() }])); rebuild(); safeRender();
+  }, e => toast('أوردرات النهارده: ' + (e.code || e.message)));
+}
+
+export async function mountDelivery(root, role) {
+  ROOT = root; ROLE = role; css(); SEEN = null;
+  ROOT.id = ROOT.id || 'delRoot'; ROOT.classList.add('delwrap');
+  DB = getDb(); UID = getUid();
+  UNSUB.forEach(u => u()); UNSUB = []; if (UDONE) { UDONE(); UDONE = null; } clearInterval(TICK); clearInterval(REFRESH);
+  const fail = e => { ROOT.innerHTML = `<div class="banner bad">مقدرتش أقرا الدليفري: ${esc(e.code || e.message)}${e.code === 'permission-denied' ? ' — حط قواعد Firebase الجديدة الأول' : ''}</div>`; };
+  UNSUB.push(onSnapshot(query(collection(DB, 'deliv_orders'), where('status', '==', 'PENDING')), s => {
+    OPEN = new Map(s.docs.map(d => [d.id, { id: d.id, ...d.data() }])); READY = 1; checkNew(); rebuild(); safeRender();
+  }, fail));
+  subDone();
+  if (CFG.features.posLinked) UNSUB.push(onSnapshot(doc(DB, 'deliv_sys', 'sync'), s => { SYS = s.exists() ? s.data() : null; }, () => { SYS = null; }));
+  if (!ROOT._wired) { ROOT._wired = 1; ROOT.addEventListener('input', () => { LAST_UI = Date.now(); }); document.addEventListener('pointerdown', armAudio, true); }
+  UNSUB.push(onSnapshot(collection(DB, 'deliv_drivers'), s => {
+    DRIVERS = s.docs.map(d => ({ id: d.id, ...d.data() }));
+    safeRender();
+  }, e => toast('قايمة المناديب: ' + (e.code || e.message))));
+  TICK = setInterval(() => { if (ROOT.isConnected) tick(); }, 1000);
+  REFRESH = setInterval(() => { if (!ROOT.isConnected) return; if (ST.liveDay !== opDay(Date.now())) subDone(); if (ST.view === 'live') safeRender(); }, 30000);
+  render();
+}
