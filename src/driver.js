@@ -21,6 +21,12 @@ function getLocation() {
   });
 }
 
+const PLATFORM = /iPhone|iPad|iPod/i.test(navigator.userAgent) ? 'ios' : /Android/i.test(navigator.userAgent) ? 'android' : 'desktop';
+const HOW = {
+  android: 'اضغط أيقونة الإعدادات (🔒 أو ⚙) يسار الرابط ← الأذونات ← الموقع ← سماح. ولو التطبيق مثبّت: دوس مطوّلاً على أيقونته ← معلومات التطبيق ← الأذونات ← الموقع ← السماح أثناء الاستخدام. وتأكد إن الموقع (GPS) شغّال من إعدادات الموبايل.',
+  ios: 'الإعدادات ← الخصوصية والأمان ← خدمات الموقع ← شغّلها، وبعدين Safari Websites ← «أثناء استخدام التطبيق». وارجع افتح البرنامج.',
+  desktop: 'اضغط أيقونة الإعدادات يسار الرابط ← Site settings ← Location ← Allow، وبعدين حدّث الصفحة.',
+};
 function css() {
   if (document.getElementById('drvCss')) return;
   const s = document.createElement('style'); s.id = 'drvCss';
@@ -30,6 +36,13 @@ function css() {
 .drvwrap .dhead h2{margin:0;font-size:19px}
 .drvwrap .dcount{background:#dbeafe;color:#1e3a8a;border-radius:99px;padding:3px 12px;font-weight:800;font-size:14px}
 .drvwrap .dnote{background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;border-radius:12px;padding:8px 12px;font-size:12.5px;margin-bottom:12px}
+.drvwrap .dloc{border-radius:12px;padding:10px 12px;font-size:13px;margin-bottom:12px;border:1px solid;display:flex;flex-direction:column;gap:6px}
+.drvwrap .dloc.ok{background:#ecfdf5;border-color:#a7f3d0;color:#065f46}
+.drvwrap .dloc.warn{background:#fffbeb;border-color:#fde68a;color:#78350f}
+.drvwrap .dloc.bad{background:#fef2f2;border-color:#fecaca;color:#991b1b}
+.drvwrap .dloc b{font-size:14px}
+.drvwrap .dloc .dlb{align-self:flex-start;min-height:38px;padding:6px 14px;border-radius:10px;border:1px solid currentColor;background:#fff;color:inherit;font-weight:800;font-size:13px}
+.drvwrap .dloc .dhow{background:rgba(255,255,255,.7);border-radius:8px;padding:8px 10px;line-height:1.7}
 .drvwrap .dcard{background:#fff;border:1px solid #e2e8f0;border-radius:18px;padding:14px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.05);display:flex;flex-direction:column;gap:8px}
 .drvwrap .dcard.late{border:2px solid #f87171;background:#fef2f2}
 .drvwrap .dtop{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
@@ -58,15 +71,38 @@ export function mountDriver(root, { db, CFG, uid, driverName }) {
   const timeStr = ts => new Intl.DateTimeFormat(CFG.locale, { timeZone: CFG.timezone, hour: 'numeric', minute: '2-digit' }).format(new Date(ts));
   const toast = t => { const d = document.createElement('div'); d.className = 'dtoast'; d.textContent = t; document.body.appendChild(d); setTimeout(() => d.remove(), 3200); };
   let ORDERS = [], DONE = [], BUSY = '', READY = false, SEEN = null;
+  let PERM = (window.isSecureContext && navigator.geolocation) ? 'unknown' : 'unsupported', TEST = null, TESTING = false;   // حالة إذن الموقع ونتيجة آخر فحص
+
+  function locBar() {
+    const btn = (t) => `<button type="button" class="dlb" data-loctest ${TESTING ? 'disabled' : ''}>${TESTING ? '⏳ بفحص…' : t}</button>`;
+    if (PERM === 'unsupported') return `<div class="dloc bad"><b>🔴 الموقع مش متاح في المتصفح ده</b><span>افتح البرنامج من كروم أو سفاري على رابط https. التسليم هيتسجّل من غير موقع.</span></div>`;
+    if (PERM === 'denied') return `<div class="dloc bad"><b>🔴 الموقع محظور</b><span>هتسلّم من غير موقع لحد ما تفتحه.</span><div class="dhow">${HOW[PLATFORM]}</div>${btn('🔄 جرّب تاني')}</div>`;
+    if (TEST && !TEST.ok) {
+      const m = TEST.status === 'timeout' ? 'الموقع اتأخر — جرّب في مكان مفتوح (بره المبنى).' : 'الـ GPS مش متاح — شغّل «الموقع/Location» من إعدادات الموبايل.';
+      return `<div class="dloc warn"><b>🟡 مقدرتش أحدد موقعك</b><span>${m}</span>${btn('🔄 فحص تاني')}</div>`;
+    }
+    if (TEST && TEST.ok) return `<div class="dloc ${TEST.acc > 100 ? 'warn' : 'ok'}"><b>${TEST.acc > 100 ? '🟡' : '🟢'} الموقع شغّال — دقة ±${TEST.acc} متر</b>${TEST.acc > 100 ? '<span>الدقة ضعيفة — لو أمكن اقف في مكان مفتوح قبل التسليم.</span>' : ''}${btn('🔄 فحص تاني')}</div>`;
+    if (PERM === 'granted') return `<div class="dloc ok"><b>🟢 الموقع مسموح</b>${btn('📍 اختبر موقعي')}</div>`;
+    return `<div class="dloc warn"><b>🟡 لسه ماسمحتش بالموقع</b><span>فعّله دلوقتي علشان التسليم يتسجّل بمكانه.</span>${btn('📍 فعّل الموقع')}</div>`;
+  }
+  async function testLocation() {
+    if (TESTING || PERM === 'unsupported') return;
+    TESTING = true; draw();
+    const r = await getLocation(); TESTING = false; TEST = r;
+    if (r.ok) PERM = 'granted'; else if (r.status === 'denied') { PERM = 'denied'; TEST = null; }
+    draw();
+  }
 
   function draw() {
     const now = Date.now();
     const list = [...ORDERS].sort((a, b) => (a.assignedAt || a.startTime) - (b.assignedAt || b.startTime));   // الأقدم الأول
     root.innerHTML = `<div class="dhead"><h2>🛵 أهلاً ${esc(driverName)}</h2><span class="dcount">${list.length} أوردر</span></div>
       <div class="dnote">📍 بنسجّل موقعك لحظة ضغطك على «تسليم» بس — مش بنتتبعك طول اليوم.</div>
+      ${locBar()}
       ${!READY ? '<div class="dempty">⏳ جاري التحميل…</div>' : list.length ? list.map(o => card(o, now)).join('') : '<div class="dempty">مفيش أوردرات عليك دلوقتي ✔</div>'}
       ${DONE.length ? `<h3>اتسلّمت دلوقتي</h3>${DONE.slice(0, 8).map(o => `<div class="ddone"><span>${esc(o.customerName || 'عميل')} · ${M(o.orderValue)}</span><span>${LOC_LBL[o.locStatus] || ''}</span></div>`).join('')}` : ''}`;
     root.querySelectorAll('[data-fin]').forEach(b => b.onclick = () => deliver(b.dataset.fin));
+    root.querySelectorAll('[data-loctest]').forEach(b => b.onclick = testLocation);
   }
 
   function card(o, now) {
@@ -85,6 +121,7 @@ export function mountDriver(root, { db, CFG, uid, driverName }) {
     if (!confirm(`تأكيد تسليم أوردر «${o.customerName || 'عميل'}» (${M(o.orderValue)})؟`)) return;
     BUSY = id; draw();
     const loc = await getLocation();
+    if (loc.ok) PERM = 'granted'; else if (loc.status === 'denied') PERM = 'denied';
     if (!loc.ok && !confirm(LOC_MSG[loc.status])) { BUSY = ''; draw(); return; }
     const data = { status: 'COMPLETED', endTime: Date.now(), endSource: 'app', comm: commFor(o.zone),
       ...(loc.ok ? { locStatus: 'ok', deliveredLoc: { lat: loc.lat, lng: loc.lng, acc: loc.acc } } : { locStatus: loc.status }) };
@@ -102,6 +139,9 @@ export function mountDriver(root, { db, CFG, uid, driverName }) {
     if (SEEN && [...ids].some(i => !SEEN.has(i))) { try { navigator.vibrate && navigator.vibrate([250, 120, 250]); } catch (e) { } toast('🆕 أوردر جديد'); }
     SEEN = ids; READY = true; draw();
   }, e => { root.innerHTML = `<div class="banner bad">مقدرتش أقرا أوردراتك: ${esc(e.code || e.message)}${e.code === 'permission-denied' ? ' — كلّم المدير (حسابك مش مربوط باسمك في قايمة المناديب)' : ''}</div>`; });
-  setInterval(() => { if (root.isConnected && !BUSY) draw(); }, 30000);   // تحديث الدقايق محلياً (من غير قراية)
+  if (PERM === 'unknown' && navigator.permissions && navigator.permissions.query) {   // لو المتصفح بيدعم Permissions API: نعرف الحالة من غير ما نطلب إذن، ونتابع أي تغيير
+    navigator.permissions.query({ name: 'geolocation' }).then(st => { PERM = st.state; st.onchange = () => { PERM = st.state; if (PERM !== 'granted') TEST = null; draw(); }; draw(); }).catch(() => { });
+  }
+  setInterval(() => { if (root.isConnected && !BUSY && !TESTING) draw(); }, 30000);   // تحديث الدقايق محلياً (من غير قراية)
   draw();
 }
